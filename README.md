@@ -34,7 +34,8 @@ console.log(detection.watermarkId, detection.confidence);
 
 `embedImage` returns a PNG `Uint8Array`, `watermarkId`, and `requestId`.
 `detectImage` returns `watermarked`, `confidence`, `watermarkId` (or `null`),
-and `requestId`. Forensic data must be a non-empty JSON object; the service
+and `requestId`. Write the returned PNG bytes directly without re-encoding them
+to preserve the embedded identifier. Forensic data must be a non-empty JSON object; the service
 embeds its SHA-256 digest. Detection recovers the digest, not the original data.
 Inputs are encoded image bytes in a Buffer or Uint8Array (up to 20 MB).
 
