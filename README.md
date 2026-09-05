@@ -13,7 +13,7 @@ npm install github:etchv-labs/node-sdk
 
 ## Embed and detect
 
-Create an API key in [your Etchv dashboard](https://pilot.etchv.com/dashboard).
+Create an API key in [your Etchv account](https://etchv.com).
 Set `ETCHV_API_KEY` in your environment. The key needs `watermarks:embed` and
 `watermarks:detect` scopes and an active plan with available credits.
 
@@ -38,7 +38,7 @@ and `requestId`. Forensic data must be a non-empty JSON object; the service
 embeds its SHA-256 digest. Detection recovers the digest, not the original data.
 Inputs are encoded image bytes in a Buffer or Uint8Array (up to 20 MB).
 
-Constructor options: `apiKey`, `baseUrl` (default `https://pilot.api.etchv.com`),
+Constructor options: `apiKey`, `baseUrl` (default `https://api.etchv.com`),
 `timeout` in milliseconds (default 120000), and `fetch` for tests.
 Both operations accept `{ filename, idempotencyKey }` as their final options.
 

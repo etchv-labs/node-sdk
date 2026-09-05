@@ -14,7 +14,7 @@ export class Etchv {
   #baseUrl;
   #timeout;
   #fetch;
-  constructor({ apiKey, baseUrl = 'https://pilot.api.etchv.com', timeout = 120000, fetch: fetchImpl = globalThis.fetch }) {
+  constructor({ apiKey, baseUrl = 'https://api.etchv.com', timeout = 120000, fetch: fetchImpl = globalThis.fetch }) {
     if (typeof apiKey !== 'string' || !apiKey.trim()) throw new TypeError('apiKey is required');
     const url = new URL(baseUrl);
     if (url.username || url.password || url.search || url.hash ||

@@ -6,7 +6,7 @@ const id = 'ab'.repeat(32);
 
 test('embedding sends multipart and exposes binary result and IDs', async () => {
   const sdk = new Etchv({ apiKey: 'test-key', fetch: async (url, init) => {
-    assert.equal(String(url), 'https://pilot.api.etchv.com/watermarks/images');
+    assert.equal(String(url), 'https://api.etchv.com/watermarks/images');
     assert.equal(init.headers['X-API-Key'], 'test-key');
     assert.equal(init.headers['Idempotency-Key'], 'unique-request');
     assert.equal(init.redirect, 'manual');
