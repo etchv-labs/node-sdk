@@ -44,11 +44,15 @@ Constructor options: `apiKey`, `baseUrl` (default `https://api.etchv.com`),
 Both operations accept `{ filename, idempotencyKey }` as their final options.
 
 Catch `EtchvError` for HTTP/protocol failures; inspect `statusCode`, `detail`,
-and `requestId`. Fetch transport and timeout errors propagate separately.
+and `requestId`. Embedding deadlines raise statusCode 0 with recovery identifiers; detection transport errors propagate separately.
 401/403 indicate authentication/scopes, 402 unavailable credits or billing,
 409 an idempotency conflict, and 422 invalid or unrecoverable images.
-No automatic retries or redirects are performed. Reusing an idempotency key
-may return 409; it does not replay the previous image. Save successful outputs.
+Embedding automatically retries transient transport/service failures with the same
+idempotency key and polls pending jobs, returning the PNG through one method call.
+The client wait defaults to 120 seconds; a timeout does not cancel the durable job.
+Reuse the same key and input to retrieve the saved result without another charge.
+A changed input with the same key returns 409. Saved results are available for 24 hours.
+Detection does not automatically retry. Neither operation follows redirects.
 
 Keep API keys on your server; this SDK is not for browser applications.
 Confidence is mean decoded-bit certainty, not a guarantee of exact recovery
@@ -65,3 +69,6 @@ This public repository is synchronized from Etchv's development monorepo.
 Issues and pull requests are welcome here; maintainers incorporate accepted
 changes into the source before publishing the next snapshot. The MIT license
 covers this SDK only, not the hosted Etchv service.
+
+To resume a known embedding job, call `getEmbedResult(requestId)`. Supply your own stable
+idempotency key when embedding if you need recovery across process restarts.

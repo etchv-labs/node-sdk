@@ -46,3 +46,42 @@ test('invalid inputs and responses fail explicitly', async () => {
   await assert.rejects(sdk.detectImage(new Uint8Array()), TypeError);
   await assert.rejects(sdk.detectImage(png), EtchvError);
 });
+
+test('durable embed retries lost response with same key then polls a trusted URL', async () => {
+  const job = 'req_' + id;
+  const calls = [];
+  const sdk = new Etchv({apiKey:'test-key', fetch:async (url, init) => {
+    calls.push({url:String(url), ...init});
+    if (calls.length === 1) throw new TypeError('connection lost');
+    if (calls.length === 2) return Response.json({request_id:job, result_url:'https://evil.example/result'}, {status:202, headers:{'retry-after':'.01'}});
+    assert.equal(init.method, 'GET');
+    assert.equal(String(url), `https://api.etchv.com/watermarks/jobs/${job}/result`);
+    return new Response(png, {headers:{'content-type':'image/png','x-watermark-id':id,'x-request-id':job}});
+  }});
+  assert.equal((await sdk.embedImage(png, {asset:'a'})).requestId, job);
+  assert.ok(calls[0].headers['Idempotency-Key']);
+  assert.equal(calls[0].headers['Idempotency-Key'], calls[1].headers['Idempotency-Key']);
+});
+test('terminal failure stops and deadline preserves recovery identifiers', async () => {
+  let calls = 0;
+  const job = 'req_' + id;
+  const failed = new Etchv({apiKey:'test-key', fetch:async () => {
+    calls++;
+    return Response.json({status:'failed'}, {status:503});
+  }});
+  await assert.rejects(failed.embedImage(png, {asset:'a'}), e => e.statusCode === 503);
+  assert.equal(calls, 1);
+  const pending = new Etchv({apiKey:'test-key',timeout:25,fetch:async () => Response.json({request_id:job},{status:202})});
+  await assert.rejects(pending.embedImage(png,{asset:'a'},{idempotencyKey:'recovery-key'}), e => e.statusCode === 0 && e.requestId === job && e.detail.idempotencyKey === 'recovery-key');
+  await assert.rejects(pending.getEmbedResult(job), e => e.statusCode === 0 && e.requestId === job);
+});
+test('interrupted PNG download is replayed safely', async () => {
+  let calls = 0;
+  const sdk = new Etchv({apiKey:'test-key',fetch:async () => {
+    calls++;
+    if (calls === 1) return new Response(new ReadableStream({start(c){c.error(new Error('lost body'));}}));
+    return new Response(png,{headers:{'content-type':'image/png','x-watermark-id':id}});
+  }});
+  assert.deepEqual((await sdk.embedImage(png,{asset:'a'})).image,png);
+  assert.equal(calls,2);
+});

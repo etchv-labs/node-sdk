@@ -36,15 +36,59 @@ export class Etchv {
     if (data !== undefined) form.append('data', data);
     const headers = { 'X-API-Key': this.#apiKey };
     if (idempotencyKey !== undefined) headers['Idempotency-Key'] = idempotencyKey;
-    const response = await this.#fetch(new URL(path, this.#baseUrl), {
-      method: 'POST', headers, body: form, redirect: 'manual', signal: AbortSignal.timeout(this.#timeout),
-    });
-    if (response.status !== 200) {
-      let detail = (await response.text()).slice(0, 10000);
-      try { detail = JSON.parse(detail); } catch { /* Preserve non-JSON error text. */ }
-      throw new EtchvError(response.status, detail, response.headers.get('x-request-id'));
+    const durable = path === 'watermarks/images';
+    if (durable && !headers['Idempotency-Key']) headers['Idempotency-Key'] = globalThis.crypto.randomUUID();
+    return this.#request(path, { method: 'POST', headers, body: form }, durable, headers['Idempotency-Key']);
+  }
+  async #request(path, init, durable, idempotencyKey) {
+    const deadline = Date.now() + this.#timeout;
+    let requestId = path.match(/watermarks\/jobs\/(req_[a-f0-9]{64})/)?.[1] || null;
+    const pause = async (seconds = 1) => {
+      await new Promise(resolve => setTimeout(resolve, Math.min(seconds * 1000, Math.max(0, deadline - Date.now()))));
+    };
+    while (Date.now() < deadline) {
+      let response;
+      let body;
+      try {
+        response = await this.#fetch(new URL(path, this.#baseUrl), {
+          ...init, redirect: 'manual', signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        });
+        requestId = response.headers.get('x-request-id') || requestId;
+        body = await response.arrayBuffer();
+      } catch (error) {
+        if (!durable) throw error;
+        await pause();
+        continue;
+      }
+      requestId = response.headers.get('x-request-id') || requestId;
+      if (response.status === 200) return new Response(body, { status: 200, headers: response.headers });
+      let detail = new TextDecoder().decode(body).slice(0, 10000);
+      try { detail = JSON.parse(detail); } catch { /* Preserve error text. */ }
+      if (durable && response.status === 202) {
+        if (!detail || typeof detail !== 'object' || !/^req_[a-f0-9]{64}$/.test(detail.request_id)) {
+          throw new EtchvError(202, 'Invalid job response', requestId);
+        }
+        requestId = detail.request_id;
+        // Construct a trusted local path; never send API keys to a server-supplied URL.
+        path = `watermarks/jobs/${requestId}/result`;
+        init = { method: 'GET', headers: { 'X-API-Key': this.#apiKey } };
+        const wait = Number(response.headers.get('retry-after') || 1);
+        await pause(Number.isFinite(wait) ? Math.min(5, Math.max(0.01, wait)) : 1);
+        continue;
+      }
+      if (durable && [429,502,503,504].includes(response.status) && detail?.status !== 'failed') {
+        await pause();
+        continue;
+      }
+      throw new EtchvError(response.status, detail, requestId);
     }
-    return response;
+    throw new EtchvError(0, { message: 'Client deadline exceeded; the job may still complete', idempotencyKey }, requestId);
+  }
+  async getEmbedResult(requestId) {
+    if (!/^req_[a-f0-9]{64}$/.test(requestId)) throw new TypeError('Invalid request ID');
+    return this.#embeddingResult(await this.#request(`watermarks/jobs/${requestId}/result`, {
+      method: 'GET', headers: { 'X-API-Key': this.#apiKey },
+    }, true));
   }
   async embedImage(image, data, options = {}) {
     if (!data || Object.getPrototypeOf(data) !== Object.prototype || !Object.keys(data).length) {
@@ -56,6 +100,9 @@ export class Etchv {
       return value;
     });
     const response = await this.#post('watermarks/images', image, options, encoded);
+    return this.#embeddingResult(response);
+  }
+  async #embeddingResult(response) {
     const watermarkId = response.headers.get('x-watermark-id');
     const requestId = response.headers.get('x-request-id');
     const result = new Uint8Array(await response.arrayBuffer());
