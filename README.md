@@ -27,14 +27,14 @@ const result = await client.embedImage(
   { recipient: 'customer-123' },
   { filename: 'photo.jpg' },
 );
-await writeFile('watermarked.png', result.image);
+await writeFile(result.filename, result.image);
 const detection = await client.detectImage(result.image);
 console.log(detection.watermarkId, detection.confidence);
 ```
 
-`embedImage` returns a PNG `Uint8Array`, `watermarkId`, and `requestId`.
+`embedImage` returns native image bytes as a `Uint8Array`, `watermarkId`, `requestId`, `contentType`, and `filename`.
 `detectImage` returns `watermarked`, `confidence`, `watermarkId` (or `null`),
-and `requestId`. Write the returned PNG bytes directly without re-encoding them
+and `requestId`. Write the returned image bytes directly without re-encoding them
 to preserve the embedded identifier. Forensic data must be a non-empty JSON object; the service
 embeds its SHA-256 digest. Detection recovers the digest, not the original data.
 Inputs are encoded image bytes in a Buffer or Uint8Array (up to 20 MB).
@@ -48,7 +48,7 @@ and `requestId`. Embedding deadlines raise statusCode 0 with recovery identifier
 401/403 indicate authentication/scopes, 402 unavailable credits or billing,
 409 an idempotency conflict, and 422 invalid or unrecoverable images.
 Embedding automatically retries transient transport/service failures with the same
-idempotency key and polls pending jobs, returning the PNG through one method call.
+idempotency key and polls pending jobs, returning the native image through one method call.
 The client wait defaults to 120 seconds; a timeout does not cancel the durable job.
 Reuse the same key and input to retrieve the saved result without another charge.
 A changed input with the same key returns 409. Saved results are available for 24 hours.
@@ -72,3 +72,9 @@ covers this SDK only, not the hosted Etchv service.
 
 To resume a known embedding job, call `getEmbedResult(requestId)`. Supply your own stable
 idempotency key when embedding if you need recovery across process restarts.
+
+
+Version 0.2.0 supports original-format image results. Use the returned filename
+when saving bytes; older clients that require PNG must be upgraded. Detection's
+`units` field reports each frame, page or layered composite separately. The
+top-level identifier is only present when all units recover the same watermark.

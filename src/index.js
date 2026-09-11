@@ -106,11 +106,13 @@ export class Etchv {
     const watermarkId = response.headers.get('x-watermark-id');
     const requestId = response.headers.get('x-request-id');
     const result = new Uint8Array(await response.arrayBuffer());
-    if (response.headers.get('content-type')?.split(';')[0] !== 'image/png' || !validId(watermarkId) ||
-        ![137,80,78,71,13,10,26,10].every((byte, i) => result[i] === byte)) {
+    const contentType = response.headers.get('content-type')?.split(';')[0];
+    const extension = imageExtension(result, contentType);
+    if (!extension || !validId(watermarkId)) {
       throw new EtchvError(200, 'Invalid embedding response', requestId);
     }
-    return { image: result, watermarkId, requestId };
+    const filename = response.headers.get('content-disposition')?.match(/filename="([A-Za-z0-9._-]+)"/)?.[1] || `image-watermarked.${extension}`;
+    return { image: result, watermarkId, requestId, contentType, filename };
   }
   async detectImage(image, options = {}) {
     const response = await this.#post('watermarks/images/detect', image, options);
@@ -122,6 +124,28 @@ export class Etchv {
         (result.watermarked ? !validId(result.watermark_id) : result.watermark_id !== null)) {
       throw new EtchvError(200, 'Invalid detection response', requestId);
     }
-    return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId };
+    const rawUnits = result.units ?? [{index:0, ...result}];
+    if (!Array.isArray(rawUnits) || !rawUnits.length || rawUnits.some((unit,index) =>
+      !unit || unit.index !== index || typeof unit.watermarked !== 'boolean' ||
+      typeof unit.confidence !== 'number' || !Number.isFinite(unit.confidence) || unit.confidence < 0 || unit.confidence > 1 ||
+      (unit.watermarked ? !validId(unit.watermark_id) : unit.watermark_id !== null))) {
+      throw new EtchvError(200, 'Invalid detection units', requestId);
+    }
+    const units = rawUnits.map(unit => ({index:unit.index, watermarked:unit.watermarked, confidence:unit.confidence, watermarkId:unit.watermark_id}));
+    return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId, units };
   }
+}
+
+function imageExtension(bytes, mime) {
+  const starts = (signature, offset = 0) => signature.every((byte, i) => bytes[offset + i] === byte);
+  const ascii = (text, offset = 0) => starts(Array.from(text, c => c.charCodeAt(0)), offset);
+  if (mime === 'image/png' && starts([137,80,78,71,13,10,26,10])) return 'png';
+  if (mime === 'image/jpeg' && starts([255,216,255])) return 'jpg';
+  if (mime === 'image/gif' && (ascii('GIF87a') || ascii('GIF89a'))) return 'gif';
+  if (mime === 'image/tiff' && (starts([73,73,42,0]) || starts([77,77,0,42]))) return 'tiff';
+  if (mime === 'image/bmp' && ascii('BM')) return 'bmp';
+  if (mime === 'image/x-portable-pixmap' && (ascii('P6') || ascii('P3'))) return 'ppm';
+  if (mime === 'image/webp' && ascii('RIFF') && ascii('WEBP', 8)) return 'webp';
+  if (mime === 'image/vnd.adobe.photoshop' && ascii('8BPS') && bytes[4] === 0) return ({1:'psd',2:'psb'})[bytes[5]];
+  return null;
 }

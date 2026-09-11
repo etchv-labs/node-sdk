@@ -1,7 +1,8 @@
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 export interface RequestOptions { filename?: string; idempotencyKey?: string }
-export interface EmbedResult { image: Uint8Array; watermarkId: string; requestId: string | null }
-export interface DetectionResult { watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null }
+export interface EmbedResult { image: Uint8Array; watermarkId: string; requestId: string | null; contentType: string; filename: string }
+export interface DetectionUnit { index: number; watermarked: boolean; confidence: number; watermarkId: string | null }
+export interface DetectionResult { units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null }
 export declare class EtchvError extends Error {
   constructor(statusCode: number, detail: unknown, requestId?: string | null);
   statusCode: number;

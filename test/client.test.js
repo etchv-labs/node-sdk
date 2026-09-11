@@ -15,7 +15,7 @@ test('embedding sends multipart and exposes binary result and IDs', async () => 
     assert.deepEqual(JSON.parse(init.body.get('data')), { recipient: 'test' });
     return new Response(png, { headers: { 'content-type':'image/png', 'x-watermark-id':id, 'x-request-id':'req_1' } });
   }});
-  assert.deepEqual(await sdk.embedImage(png, { recipient:'test' }, { filename:'photo.png', idempotencyKey:'unique-request' }), { image:png, watermarkId:id, requestId:'req_1' });
+  assert.deepEqual(await sdk.embedImage(png, { recipient:'test' }, { filename:'photo.png', idempotencyKey:'unique-request' }), { image:png, watermarkId:id, requestId:'req_1', contentType:'image/png', filename:'image-watermarked.png' });
 });
 test('detection maps true and false results', async () => {
   for (const marked of [true, false]) {
@@ -84,4 +84,25 @@ test('interrupted PNG download is replayed safely', async () => {
   }});
   assert.deepEqual((await sdk.embedImage(png,{asset:'a'})).image,png);
   assert.equal(calls,2);
+});
+
+test('native image signatures and download metadata survive embedding', async () => {
+  const fixtures = [
+    ['image/jpeg', 'jpg', [255,216,255]], ['image/gif', 'gif', [...Buffer.from('GIF89a')]],
+    ['image/tiff', 'tiff', [73,73,42,0]], ['image/bmp', 'bmp', [...Buffer.from('BM')]],
+    ['image/x-portable-pixmap', 'ppm', [...Buffer.from('P6\n')]],
+    ['image/webp', 'webp', [...Buffer.from('RIFF0000WEBP')]],
+    ['image/vnd.adobe.photoshop', 'psd', [56,66,80,83,0,1]],
+    ['image/vnd.adobe.photoshop', 'psb', [56,66,80,83,0,2]],
+  ];
+  for (const [mime, ext, bytes] of fixtures) {
+    const body = new Uint8Array(bytes);
+    const sdk = new Etchv({apiKey:'test', fetch:async () => new Response(body, {headers:{'content-type':mime, 'x-watermark-id':id, 'content-disposition':`attachment; filename="original.${ext}"`}})});
+    const result = await sdk.embedImage(png, {asset:'test'});
+    assert.deepEqual(result.image, body);
+    assert.equal(result.contentType, mime);
+    assert.equal(result.filename, `original.${ext}`);
+    const wrong = new Etchv({apiKey:'test', fetch:async () => new Response(png, {headers:{'content-type':mime, 'x-watermark-id':id}})});
+    await assert.rejects(wrong.embedImage(png, {asset:'test'}), EtchvError);
+  }
 });
