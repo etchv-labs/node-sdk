@@ -62,7 +62,7 @@ export class Etchv {
         continue;
       }
       requestId = response.headers.get('x-request-id') || requestId;
-      if (response.status === 200) return new Response(body, { status: 200, headers: response.headers });
+      if ([200,204].includes(response.status)) return new Response(response.status === 204 ? null : body, { status: response.status, headers: response.headers });
       let detail = new TextDecoder().decode(body).slice(0, 10000);
       try { detail = JSON.parse(detail); } catch { /* Preserve error text. */ }
       if (durable && response.status === 202) {
@@ -85,6 +85,27 @@ export class Etchv {
     }
     throw new EtchvError(0, { message: 'Client deadline exceeded; the job may still complete', idempotencyKey }, requestId);
   }
+  #assetPath(id) {
+    if (typeof id !== 'string' || !/^ast_[a-f0-9]{64}$/.test(id)) throw new TypeError('Invalid asset ID');
+    return `assets/${id}`;
+  }
+  async #assetRequest(path, method = 'GET', body) {
+    return this.#request(path, {method, headers: {'X-API-Key': this.#apiKey, ...(body === undefined ? {} : {'Content-Type':'application/json'})}, ...(body === undefined ? {} : {body:JSON.stringify(body, (_key, value) => { if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError('Metadata numbers must be finite'); return value; })})}, false);
+  }
+  async listAssets({limit = 25, cursor, kind, mediaType, watermarkId} = {}) {
+    const params = new URLSearchParams({limit:String(limit)});
+    for (const [key,value] of Object.entries({cursor,kind,media_type:mediaType,watermark_id:watermarkId})) if (value != null) params.set(key,value);
+    return (await this.#assetRequest(`assets?${params}`)).json();
+  }
+  async getAsset(id) { return (await this.#assetRequest(this.#assetPath(id))).json(); }
+  async updateAsset(id, changes) { return (await this.#assetRequest(this.#assetPath(id), 'PATCH', changes)).json(); }
+  async deleteAsset(id) { await this.#assetRequest(this.#assetPath(id), 'DELETE'); }
+  async deleteAssets(ids) {
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50) throw new TypeError('Provide 1–50 asset IDs');
+    ids.forEach(id => this.#assetPath(id));
+    await this.#assetRequest('assets/bulk-delete', 'POST', {asset_ids:ids});
+  }
+  async downloadAsset(id) { return new Uint8Array(await (await this.#assetRequest(this.#assetPath(id) + '/content')).arrayBuffer()); }
   async getEmbedResult(requestId) {
     if (!/^req_[a-f0-9]{64}$/.test(requestId)) throw new TypeError('Invalid request ID');
     return this.#embeddingResult(await this.#request(`watermarks/jobs/${requestId}/result`, {
@@ -116,7 +137,7 @@ export class Etchv {
       throw new EtchvError(200, 'Invalid embedding response', requestId);
     }
     const filename = response.headers.get('content-disposition')?.match(/filename="([A-Za-z0-9._-]+)"/)?.[1] || `image-watermarked.${extension}`;
-    return { image: result, watermarkId, requestId, contentType, filename };
+    return { image: result, watermarkId, requestId, contentType, filename, assetId: response.headers.get("x-asset-id"), sourceAssetId: response.headers.get("x-source-asset-id") };
   }
   async detectImage(image, options = {}) { return this.#detect('images', image, options); }
   async detectDocument(document, options = {}) { return this.#detect('documents', document, {filename:'document.pdf', ...options}); }
