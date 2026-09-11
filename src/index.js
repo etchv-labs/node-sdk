@@ -36,11 +36,12 @@ export class Etchv {
     if (data !== undefined) form.append('data', data);
     const headers = { 'X-API-Key': this.#apiKey };
     if (idempotencyKey !== undefined) headers['Idempotency-Key'] = idempotencyKey;
-    const durable = path === 'watermarks/images';
+    const durable = ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'].includes(path);
     if (durable && !headers['Idempotency-Key']) headers['Idempotency-Key'] = globalThis.crypto.randomUUID();
     return this.#request(path, { method: 'POST', headers, body: form }, durable, headers['Idempotency-Key']);
   }
   async #request(path, init, durable, idempotencyKey) {
+    const detectionJob = path === "watermarks/videos/detect" || path.includes("detection-jobs/");
     const deadline = Date.now() + this.#timeout;
     let requestId = path.match(/watermarks\/jobs\/(req_[a-f0-9]{64})/)?.[1] || null;
     const pause = async (seconds = 1) => {
@@ -70,7 +71,7 @@ export class Etchv {
         }
         requestId = detail.request_id;
         // Construct a trusted local path; never send API keys to a server-supplied URL.
-        path = `watermarks/jobs/${requestId}/result`;
+        path = `watermarks/${detectionJob ? "detection-jobs" : "jobs"}/${requestId}/result`;
         init = { method: 'GET', headers: { 'X-API-Key': this.#apiKey } };
         const wait = Number(response.headers.get('retry-after') || 1);
         await pause(Number.isFinite(wait) ? Math.min(5, Math.max(0.01, wait)) : 1);
@@ -90,7 +91,10 @@ export class Etchv {
       method: 'GET', headers: { 'X-API-Key': this.#apiKey },
     }, true));
   }
-  async embedImage(image, data, options = {}) {
+  async embedImage(image, data, options = {}) { return this.#embed('images', image, data, options); }
+  async embedDocument(document, data, options = {}) { return this.#embed('documents', document, data, {filename:'document.pdf', ...options}); }
+  async embedVideo(video, data, options = {}) { return this.#embed("videos", video, data, {filename:"video.mp4", ...options}); }
+  async #embed(media, image, data, options) {
     if (!data || Object.getPrototypeOf(data) !== Object.prototype || !Object.keys(data).length) {
       throw new TypeError('data must be a non-empty JSON object');
     }
@@ -99,7 +103,7 @@ export class Etchv {
           (typeof value === 'number' && !Number.isFinite(value))) throw new TypeError('data must contain JSON values');
       return value;
     });
-    const response = await this.#post('watermarks/images', image, options, encoded);
+    const response = await this.#post(`watermarks/${media}`, image, options, encoded);
     return this.#embeddingResult(response);
   }
   async #embeddingResult(response) {
@@ -114,8 +118,11 @@ export class Etchv {
     const filename = response.headers.get('content-disposition')?.match(/filename="([A-Za-z0-9._-]+)"/)?.[1] || `image-watermarked.${extension}`;
     return { image: result, watermarkId, requestId, contentType, filename };
   }
-  async detectImage(image, options = {}) {
-    const response = await this.#post('watermarks/images/detect', image, options);
+  async detectImage(image, options = {}) { return this.#detect('images', image, options); }
+  async detectDocument(document, options = {}) { return this.#detect('documents', document, {filename:'document.pdf', ...options}); }
+  async detectVideo(video, options = {}) { return this.#detect("videos", video, {filename:"video.mp4", ...options}); }
+  async #detect(media, image, options) {
+    const response = await this.#post(`watermarks/${media}/detect`, image, options);
     const requestId = response.headers.get('x-request-id');
     let result;
     try { result = await response.json(); } catch { throw new EtchvError(200, 'Invalid detection response', requestId); }
@@ -139,6 +146,8 @@ export class Etchv {
 function imageExtension(bytes, mime) {
   const starts = (signature, offset = 0) => signature.every((byte, i) => bytes[offset + i] === byte);
   const ascii = (text, offset = 0) => starts(Array.from(text, c => c.charCodeAt(0)), offset);
+  if ((mime === 'video/mp4' || mime === 'video/quicktime') && ascii('ftyp',4)) return mime === 'video/mp4' ? 'mp4' : 'mov';
+  if (mime === 'application/pdf' && ascii('%PDF-')) return 'pdf';
   if (mime === 'image/png' && starts([137,80,78,71,13,10,26,10])) return 'png';
   if (mime === 'image/jpeg' && starts([255,216,255])) return 'jpg';
   if (mime === 'image/gif' && (ascii('GIF87a') || ascii('GIF89a'))) return 'gif';

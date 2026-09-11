@@ -12,6 +12,10 @@ export declare class EtchvError extends Error {
 export declare class Etchv {
   constructor(options: { apiKey: string; baseUrl?: string; timeout?: number; fetch?: typeof globalThis.fetch });
   embedImage(image: Uint8Array, data: { [key: string]: JsonValue }, options?: RequestOptions): Promise<EmbedResult>;
+  embedDocument(document: Uint8Array, data: { [key: string]: JsonValue }, options?: RequestOptions): Promise<EmbedResult>;
+  detectDocument(document: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
+  embedVideo(video: Uint8Array, data: { [key: string]: JsonValue }, options?: RequestOptions): Promise<EmbedResult>;
+  detectVideo(video: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
   getEmbedResult(requestId: string): Promise<EmbedResult>;
   detectImage(image: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
 }

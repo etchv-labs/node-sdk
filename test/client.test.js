@@ -106,3 +106,38 @@ test('native image signatures and download metadata survive embedding', async ()
     await assert.rejects(wrong.embedImage(png, {asset:'test'}), EtchvError);
   }
 });
+
+test('PDF embedding uses durable document route and preserves PDF bytes', async () => {
+  const pdf = new TextEncoder().encode('%PDF-1.7\nfixture');
+  let calls = 0;
+  const requestId = 'req_' + 'a'.repeat(64);
+  const sdk = new Etchv({apiKey:'test-key', fetch:async(url, init) => {
+    calls++;
+    if(calls === 1) {
+      assert.equal(url.pathname, '/watermarks/documents');
+      assert.ok(init.headers['Idempotency-Key']);
+      return Response.json({request_id:requestId}, {status:202, headers:{'retry-after':'0.01'}});
+    }
+    assert.equal(url.pathname, `/watermarks/jobs/${requestId}/result`);
+    return new Response(pdf, {headers:{'content-type':'application/pdf', 'x-watermark-id':id, 'content-disposition':'attachment; filename="document.pdf"'}});
+  }});
+  const result = await sdk.embedDocument(pdf, {recipient:'test'});
+  assert.deepEqual(result.image, pdf);
+  assert.equal(result.contentType, 'application/pdf');
+  assert.equal(calls, 2);
+});
+
+test('video detection polls the scoped durable result endpoint', async () => {
+  let calls=0; const requestId='req_'+'c'.repeat(64);
+  const sdk=new Etchv({apiKey:'test-key',fetch:async(url) => {
+    calls++;
+    if(calls===1) {
+      assert.equal(url.pathname,'/watermarks/videos/detect');
+      return Response.json({request_id:requestId},{status:202,headers:{'retry-after':'0.01'}});
+    }
+    assert.equal(url.pathname,`/watermarks/detection-jobs/${requestId}/result`);
+    return Response.json({watermarked:false,confidence:.5,watermark_id:null,units:[{index:0,watermarked:false,confidence:.5,watermark_id:null}]});
+  }});
+  assert.equal((await sdk.detectVideo(new Uint8Array([0]))).watermarked,false);
+  assert.equal(calls,2);
+});
