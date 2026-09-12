@@ -15,7 +15,7 @@ test('embedding sends multipart and exposes binary result and IDs', async () => 
     assert.deepEqual(JSON.parse(init.body.get('data')), { recipient: 'test' });
     return new Response(png, { headers: { 'content-type':'image/png', 'x-watermark-id':id, 'x-request-id':'req_1' } });
   }});
-  assert.deepEqual(await sdk.embedImage(png, { recipient:'test' }, { filename:'photo.png', idempotencyKey:'unique-request' }), { image:png, watermarkId:id, requestId:'req_1', contentType:'image/png', filename:'image-watermarked.png', assetId:null, sourceAssetId:null });
+  assert.deepEqual(await sdk.embedImage(png, { recipient:'test' }, { filename:'photo.png', idempotencyKey:'unique-request' }), { image:png, watermarkId:id, requestId:'req_1', contentType:'image/png', filename:'image-watermarked.png', assetId:null, sourceAssetId:null, storageDeliveryId:null });
 });
 test('detection maps true and false results', async () => {
   for (const marked of [true, false]) {

@@ -1,8 +1,8 @@
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
-export interface RequestOptions { filename?: string; idempotencyKey?: string }
+export interface RequestOptions { filename?: string; idempotencyKey?: string; storageDestinationId?: string; storageKey?: string }
 export interface AsyncOptions extends RequestOptions { webhookId?: string }
-export interface Job { request_id: string; status: string; status_url: string; result_url: string; operation: 'embed' | 'detect'; webhook_id: string | null; error_code: string | null; asset_id: string | null; source_asset_id: string | null; format: string; frame_count: number; attempts: number; credits: number; result_expires_at: string | null }
-export interface EmbedResult { image: Uint8Array; watermarkId: string; requestId: string | null; contentType: string; filename: string; assetId: string | null; sourceAssetId: string | null }
+export interface Job { storage_delivery_id?: string | null; storage_destination_id?: string | null; request_id: string; status: string; status_url: string; result_url: string; operation: 'embed' | 'detect'; webhook_id: string | null; error_code: string | null; asset_id: string | null; source_asset_id: string | null; format: string; frame_count: number; attempts: number; credits: number; result_expires_at: string | null }
+export interface EmbedResult { image: Uint8Array; watermarkId: string; requestId: string | null; contentType: string; filename: string; assetId: string | null; sourceAssetId: string | null; storageDeliveryId: string | null }
 export interface DetectionUnit { index: number; watermarked: boolean; confidence: number; watermarkId: string | null }
 export interface DetectionResult { units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null }
 export declare class EtchvError extends Error {
@@ -29,6 +29,7 @@ export declare class Etchv {
   deleteAssets(ids: string[]): Promise<void>;
   downloadAsset(id: string): Promise<Uint8Array>;
   constructor(options: { apiKey: string; baseUrl?: string; timeout?: number; fetch?: typeof globalThis.fetch });
+  getStorageDelivery(id: string): Promise<Record<string, JsonValue>>;
   embedImage(image: Uint8Array, data: { [key: string]: JsonValue }, options?: RequestOptions): Promise<EmbedResult>;
   embedDocument(document: Uint8Array, data: { [key: string]: JsonValue }, options?: RequestOptions): Promise<EmbedResult>;
   detectDocument(document: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;

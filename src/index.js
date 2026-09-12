@@ -27,16 +27,23 @@ export class Etchv {
     this.#timeout = timeout;
     this.#fetch = fetchImpl;
   }
-  async #post(path, image, { filename = 'image.png', idempotencyKey } = {}, data) {
+  async #post(path, image, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey } = {}, data) {
     if (!(image instanceof Uint8Array) || !image.byteLength || image.byteLength > 20 * 1024 * 1024) {
       throw new TypeError('image must be a Buffer or Uint8Array containing 1 byte to 20 MB');
+    }
+    if (storageKey != null && !storageDestinationId) throw new TypeError('storageKey requires storageDestinationId');
+    if (storageDestinationId != null) {
+      if (data === undefined || !/^dst_[a-f0-9]{32}$/.test(storageDestinationId)) throw new TypeError('Invalid storage destination or detection request');
+      const params = new URLSearchParams({storage_destination_id: storageDestinationId});
+      if (storageKey != null) params.set('storage_key', storageKey);
+      path += (path.includes('?') ? '&' : '?') + params;
     }
     const form = new FormData();
     form.append('file', new Blob([image], { type: 'application/octet-stream' }), filename);
     if (data !== undefined) form.append('data', data);
     const headers = { 'X-API-Key': this.#apiKey };
     if (idempotencyKey !== undefined) headers['Idempotency-Key'] = idempotencyKey;
-    const durable = path.split("?")[0].endsWith("/async") || ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'].includes(path);
+    const durable = path.split("?")[0].endsWith("/async") || ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'].includes(path.split('?')[0]);
     if (durable && !headers['Idempotency-Key']) headers['Idempotency-Key'] = globalThis.crypto.randomUUID();
     return this.#request(path, { method: 'POST', headers, body: form }, durable, headers['Idempotency-Key']);
   }
@@ -113,6 +120,10 @@ export class Etchv {
   async #assetRequest(path, method = 'GET', body) {
     return this.#request(path, {method, headers: {'X-API-Key': this.#apiKey, ...(body === undefined ? {} : {'Content-Type':'application/json'})}, ...(body === undefined ? {} : {body:JSON.stringify(body, (_key, value) => { if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError('Metadata numbers must be finite'); return value; })})}, false);
   }
+  async getStorageDelivery(id) {
+    if (!/^std_[a-f0-9]{64}$/.test(id)) throw new TypeError('Invalid storage delivery ID');
+    return (await this.#assetRequest(`storage/deliveries/${id}`)).json();
+  }
   async listAssets({limit = 25, cursor, kind, mediaType, watermarkId} = {}) {
     const params = new URLSearchParams({limit:String(limit)});
     for (const [key,value] of Object.entries({cursor,kind,media_type:mediaType,watermark_id:watermarkId})) if (value != null) params.set(key,value);
@@ -158,7 +169,7 @@ export class Etchv {
       throw new EtchvError(200, 'Invalid embedding response', requestId);
     }
     const filename = response.headers.get('content-disposition')?.match(/filename="([A-Za-z0-9._-]+)"/)?.[1] || `image-watermarked.${extension}`;
-    return { image: result, watermarkId, requestId, contentType, filename, assetId: response.headers.get("x-asset-id"), sourceAssetId: response.headers.get("x-source-asset-id") };
+    return { image: result, watermarkId, requestId, contentType, filename, assetId: response.headers.get("x-asset-id"), sourceAssetId: response.headers.get("x-source-asset-id"), storageDeliveryId: response.headers.get("x-storage-delivery-id") };
   }
   async detectImage(image, options = {}) { return this.#detect('images', image, options); }
   async detectDocument(document, options = {}) { return this.#detect('documents', document, {filename:'document.pdf', ...options}); }
