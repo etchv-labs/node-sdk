@@ -36,11 +36,12 @@ export class Etchv {
     if (data !== undefined) form.append('data', data);
     const headers = { 'X-API-Key': this.#apiKey };
     if (idempotencyKey !== undefined) headers['Idempotency-Key'] = idempotencyKey;
-    const durable = ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'].includes(path);
+    const durable = path.split("?")[0].endsWith("/async") || ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'].includes(path);
     if (durable && !headers['Idempotency-Key']) headers['Idempotency-Key'] = globalThis.crypto.randomUUID();
     return this.#request(path, { method: 'POST', headers, body: form }, durable, headers['Idempotency-Key']);
   }
   async #request(path, init, durable, idempotencyKey) {
+    const asyncSubmission = path.split("?")[0].endsWith("/async");
     const detectionJob = path === "watermarks/videos/detect" || path.includes("detection-jobs/");
     const deadline = Date.now() + this.#timeout;
     let requestId = path.match(/watermarks\/jobs\/(req_[a-f0-9]{64})/)?.[1] || null;
@@ -62,7 +63,7 @@ export class Etchv {
         continue;
       }
       requestId = response.headers.get('x-request-id') || requestId;
-      if ([200,204].includes(response.status)) return new Response(response.status === 204 ? null : body, { status: response.status, headers: response.headers });
+      if ([200,201,204].includes(response.status) || (asyncSubmission && response.status === 202)) return new Response(response.status === 204 ? null : body, { status: response.status, headers: response.headers });
       let detail = new TextDecoder().decode(body).slice(0, 10000);
       try { detail = JSON.parse(detail); } catch { /* Preserve error text. */ }
       if (durable && response.status === 202) {
@@ -84,6 +85,26 @@ export class Etchv {
       throw new EtchvError(response.status, detail, requestId);
     }
     throw new EtchvError(0, { message: 'Client deadline exceeded; the job may still complete', idempotencyKey }, requestId);
+  }
+  #asyncPath(media, detect, webhookId) {
+    if (!['images','documents','videos'].includes(media)) throw new TypeError('media must be images, documents or videos');
+    if (webhookId != null && !/^wh_[a-f0-9]{32}$/.test(webhookId)) throw new TypeError('Invalid webhook ID');
+    return `watermarks/${media}${detect ? '/detect' : ''}/async${webhookId ? '?webhook_id=' + webhookId : ''}`;
+  }
+  async submitEmbed(media, file, data, {webhookId, ...options} = {}) {
+    if (!data || Object.getPrototypeOf(data) !== Object.prototype || !Object.keys(data).length) throw new TypeError('data must be a non-empty JSON object');
+    const body = JSON.stringify(data, (_key, value) => {
+      if (value === undefined || typeof value === 'function' || typeof value === 'symbol' || (typeof value === 'number' && !Number.isFinite(value))) throw new TypeError('data must contain JSON values');
+      return value;
+    });
+    return (await this.#post(this.#asyncPath(media, false, webhookId), file, options, body)).json();
+  }
+  async submitDetection(media, file, {webhookId, ...options} = {}) {
+    return (await this.#post(this.#asyncPath(media, true, webhookId), file, options)).json();
+  }
+  async getJob(requestId, {detect = false} = {}) {
+    if (!/^req_[a-f0-9]{64}$/.test(requestId)) throw new TypeError('Invalid request ID');
+    return (await this.#assetRequest(`watermarks/${detect ? 'detection-jobs' : 'jobs'}/${requestId}`)).json();
   }
   #assetPath(id) {
     if (typeof id !== 'string' || !/^ast_[a-f0-9]{64}$/.test(id)) throw new TypeError('Invalid asset ID');
