@@ -1,6 +1,6 @@
 {
   "name": "@etchv/sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Node.js client for Etchv image watermarking",
   "type": "module",
   "main": "./src/index.js",

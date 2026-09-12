@@ -1,7 +1,7 @@
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 export interface RequestOptions { filename?: string; idempotencyKey?: string; storageDestinationId?: string; storageKey?: string }
 export interface AsyncOptions extends RequestOptions { webhookId?: string }
-export interface Job { storage_delivery_id?: string | null; storage_destination_id?: string | null; request_id: string; status: string; status_url: string; result_url: string; operation: 'embed' | 'detect'; webhook_id: string | null; error_code: string | null; asset_id: string | null; source_asset_id: string | null; format: string; frame_count: number; attempts: number; credits: number; result_expires_at: string | null }
+export interface Job { storage_provider?: string; storage_delivery_id?: string | null; storage_destination_id?: string | null; request_id: string; status: string; status_url: string; result_url: string; operation: 'embed' | 'detect'; webhook_id: string | null; error_code: string | null; asset_id: string | null; source_asset_id: string | null; format: string; frame_count: number; attempts: number; credits: number; result_expires_at: string | null }
 export interface EmbedResult { image: Uint8Array; watermarkId: string; requestId: string | null; contentType: string; filename: string; assetId: string | null; sourceAssetId: string | null; storageDeliveryId: string | null }
 export interface DetectionUnit { index: number; watermarked: boolean; confidence: number; watermarkId: string | null }
 export interface DetectionResult { units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null }
@@ -12,10 +12,11 @@ export declare class EtchvError extends Error {
   requestId: string | null;
 }
 export interface Asset {
+  storage_provider?: "etchv" | "s3" | "gcs" | "azure"; storage_status?: string; storage_destination_id?: string | null; storage_delivery_id?: string | null; staging_expires_at?: string | null; staging_deleted_at?: string | null;
   id: string; name: string; kind: "source" | "watermarked"; media_type: "image" | "document" | "video";
   format: string; content_type: string; size_bytes: number; sha256: string; parent_asset_id: string | null;
   request_id: string; watermark_id: string | null; created_at: string; updated_at: string;
-  file_expires_at: string; file_available: boolean; version: number; metadata: Record<string, JsonValue> | null; download_url: string | null;
+  file_expires_at: string | null; file_available: boolean; version: number; metadata: Record<string, JsonValue> | null; download_url: string | null;
 }
 export interface AssetPage { items: Asset[]; next_cursor: string | null }
 export declare class Etchv {

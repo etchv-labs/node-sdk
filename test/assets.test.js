@@ -16,7 +16,8 @@ test('asset requests preserve filters, versions, downloads and deletion semantic
  }});
  assert.equal((await client.listAssets({kind:'watermarked'})).next_cursor,'next-page');
  assert.equal(calls[0].url.searchParams.get('kind'),'watermarked');
- assert.equal((await client.getAsset(record.id)).metadata.campaign,'launch');
+ const asset=await client.getAsset(record.id);
+ assert.equal(asset.metadata.campaign,'launch'); assert.equal(asset.file_expires_at,null); assert.equal(asset.storage_provider,'s3');
  assert.equal((await client.updateAsset(record.id,{version:1,name:'renamed'})).version,2);
  assert.equal(new TextDecoder().decode(await client.downloadAsset(record.id)),'file');
  await client.deleteAsset(record.id);await client.deleteAssets([record.id]);
