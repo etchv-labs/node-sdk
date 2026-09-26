@@ -1,6 +1,6 @@
 {
   "name": "@etchv-labs/sdk",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Official Node.js SDK for the Etchv API: forensic watermarking and detection for images, PDFs and videos",
   "keywords": ["etchv", "watermark", "watermarking", "forensic-watermarking", "invisible-watermark", "detection", "pdf", "video", "sdk", "api-client"],
   "homepage": "https://etchv.com/docs",

@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.0.1';
+export const VERSION = '1.0.2';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const FILENAMES = { images: 'image.png', documents: 'document.pdf', videos: 'video.mp4' };
@@ -179,12 +179,20 @@ export class Etchv {
       let response;
       let body;
       try {
-        const limit = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
-        response = await this.#fetch(new URL(path, this.#baseUrl), {
-          ...init, redirect: 'manual', signal: signal ? AbortSignal.any([signal, limit]) : limit,
-        });
-        requestId = response.headers.get('x-request-id') || requestId;
-        body = await response.arrayBuffer();
+        // A referenced timer, unlike AbortSignal.timeout(), keeps Node alive until the
+        // deadline fires, so a stalled request always ends in a timeout error.
+        const limit = new AbortController();
+        const timer = setTimeout(() => limit.abort(new DOMException('Client deadline exceeded', 'TimeoutError')),
+          Math.max(1, deadline - Date.now()));
+        try {
+          response = await this.#fetch(new URL(path, this.#baseUrl), {
+            ...init, redirect: 'manual', signal: signal ? AbortSignal.any([signal, limit.signal]) : limit.signal,
+          });
+          requestId = response.headers.get('x-request-id') || requestId;
+          body = await response.arrayBuffer();
+        } finally {
+          clearTimeout(timer);
+        }
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
         if (error?.name === 'TimeoutError' || Date.now() >= deadline) throw expired();
