@@ -1,0 +1,27 @@
+{
+  "name": "@etchv-labs/sdk",
+  "version": "1.0.1",
+  "description": "Official Node.js SDK for the Etchv API: forensic watermarking and detection for images, PDFs and videos",
+  "keywords": ["etchv", "watermark", "watermarking", "forensic-watermarking", "invisible-watermark", "detection", "pdf", "video", "sdk", "api-client"],
+  "homepage": "https://etchv.com/docs",
+  "bugs": {"url": "https://github.com/etchv-labs/node-sdk/issues"},
+  "repository": {"type": "git", "url": "git+https://github.com/etchv-labs/node-sdk.git"},
+  "license": "MIT",
+  "author": "Etchv Labs",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {"types": "./src/index.d.ts", "default": "./src/index.js"},
+    "./package.json": "./package.json"
+  },
+  "files": ["src/index.js", "src/index.d.ts", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "engines": {"node": ">=22.12"},
+  "publishConfig": {"access": "public", "provenance": true},
+  "scripts": {
+    "test": "node --test \"test/*.test.js\" \"test/*.test.ts\"",
+    "build": "node --check src/index.js",
+    "prepublishOnly": "npm run build && npm test"
+  }
+}
