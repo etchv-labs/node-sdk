@@ -33,8 +33,9 @@ console.log(detection.watermarked, detection.watermarkId, detection.confidence);
 ```
 
 Use `embedDocument` / `detectDocument` for PDFs and `embedVideo` / `detectVideo`
-for MP4/MOV. Uploads are limited to 20 MB. Detection recovers a SHA-256 digest
-of your data, not the data itself. Every method accepts `signal` and `timeout`.
+for MP4/MOV. Image uploads are limited to 50 MB; PDF and video uploads to 20 MB.
+Detection recovers a SHA-256 digest of your data, not the data itself. Every
+method accepts `signal` and `timeout`.
 
 ## Async jobs
 

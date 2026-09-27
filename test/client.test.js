@@ -44,6 +44,7 @@ test('invalid inputs and responses fail explicitly', async () => {
   await assert.rejects(sdk.embedImage(png, {}), TypeError);
   await assert.rejects(sdk.embedImage(png, {value:NaN}), TypeError);
   await assert.rejects(sdk.detectImage(new Uint8Array()), TypeError);
+  await assert.rejects(sdk.detectImage(new Uint8Array(50 * 1024 * 1024 + 1)), /50 MB/);
   await assert.rejects(sdk.detectImage(png), EtchvError);
 });
 

@@ -131,8 +131,8 @@ export class Etchv {
   }
 
   async #post(path, file, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey, signal, timeout } = {}, data) {
-    if (!(file instanceof Uint8Array) || !file.byteLength || file.byteLength > 20 * 1024 * 1024) {
-      throw new TypeError('file must be a Buffer or Uint8Array containing 1 byte to 20 MB');
+    if (!(file instanceof Uint8Array) || !file.byteLength || file.byteLength > 50 * 1024 * 1024) {
+      throw new TypeError('file must be a Buffer or Uint8Array containing 1 byte to 50 MB');
     }
     if (typeof filename !== 'string' || !filename) throw new TypeError('filename must be a non-empty string');
     if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(idempotencyKey))) {
