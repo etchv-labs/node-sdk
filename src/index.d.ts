@@ -4,6 +4,8 @@ export declare const VERSION: string;
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 export type Media = 'images' | 'documents' | 'videos';
 export type MediaType = 'image' | 'document' | 'video';
+/** Processor for watermark embedding and detection. */
+export type Accelerator = 'cpu' | 'gpu';
 
 /** Options accepted by every API method. */
 export interface CallOptions {
@@ -22,6 +24,12 @@ export interface RequestOptions extends CallOptions {
   storageDestinationId?: string;
   /** Relative object key beneath the destination prefix. Requires `storageDestinationId`. */
   storageKey?: string;
+  /**
+   * `'gpu'` requests GPU processing (Business and Enterprise plans; other plans
+   * get 403). GPU operations cost 3× credits; when no GPU is ready the job runs
+   * on CPU at normal credits. Omit for CPU (the default).
+   */
+  accelerator?: Accelerator;
 }
 export interface AsyncOptions extends RequestOptions {
   /** Enabled webhook endpoint (`wh_…`) that receives a signed terminal event. */
@@ -39,24 +47,38 @@ export interface Job {
   asset_id: string | null; source_asset_id: string | null; format: string; frame_count: number;
   attempts: number; credits: number; result_expires_at: string | null;
   storage_provider?: string; storage_delivery_id?: string | null; storage_destination_id?: string | null;
+  /** Requested and actual processor (the actual one is `'cpu'` after an automatic fallback). */
+  accelerator_requested?: Accelerator; accelerator?: Accelerator | null;
 }
 export interface EmbedResult {
   /** Native watermarked file bytes (image, PDF or video). Write them without re-encoding. */
   image: Uint8Array; watermarkId: string; requestId: string | null; contentType: string; filename: string;
   assetId: string | null; sourceAssetId: string | null; storageDeliveryId: string | null;
+  /** Processor that actually ran, or `null` when the response did not say. */
+  accelerator: Accelerator | null;
 }
 export interface DetectionUnit { index: number; watermarked: boolean; confidence: number; watermarkId: string | null }
-export interface DetectionResult { units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null }
+export interface DetectionResult {
+  units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null;
+  /** Processor that actually ran, or `null` when the response did not say. */
+  accelerator: Accelerator | null;
+}
 
 /** HTTP or protocol failure. `statusCode` is 0 for a client deadline. */
 export declare class EtchvError extends Error {
-  constructor(statusCode: number, detail: unknown, requestId?: string | null);
+  constructor(statusCode: number, detail: unknown, requestId?: string | null, retryAfter?: number | null);
   /** HTTP status, or 0 when the client deadline passed. */
   statusCode: number;
-  /** Parsed error body (usually `{ detail: ... }`). */
+  /** Parsed error body (usually `{ detail: ... }`, where `detail` may be a string or an object). */
   detail: unknown;
   /** `X-Request-ID` or job request ID, for support and recovery. */
   requestId: string | null;
+  /** Machine-readable `detail.code` from the API, such as `'rate_limited'` or `'concurrency_limited'` on HTTP 429. */
+  code: string | null;
+  /** Numeric `detail.limit` from the API (the exceeded rate or concurrency limit), when present. */
+  limit: number | null;
+  /** `Retry-After` delay in seconds, when the API sent one (HTTP 429). */
+  retryAfter: number | null;
 }
 /** HTTP 401. */ export declare class AuthenticationError extends EtchvError {}
 /** HTTP 402. */ export declare class PaymentRequiredError extends EtchvError {}

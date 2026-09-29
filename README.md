@@ -37,6 +37,20 @@ for MP4/MOV. Image uploads are limited to 50 MB; PDF and video uploads to 20 MB.
 Detection recovers a SHA-256 digest of your data, not the data itself. Every
 method accepts `signal` and `timeout`.
 
+## GPU processing
+
+On Business and Enterprise plans, pass `accelerator: 'gpu'` to any embed,
+detect or `submit*` method (other plans get `PermissionDeniedError`, HTTP 403).
+GPU operations cost 3× credits. If no GPU is ready, the job runs on CPU at
+normal credits instead. `result.accelerator` reports what actually ran
+(`'gpu'`, `'cpu'` or `null` if the response did not say); job receipts include
+`accelerator_requested` and `accelerator`.
+
+```js
+const fast = await client.embedVideo(videoBytes, { recipient: 'customer-123' }, { accelerator: 'gpu' });
+console.log(fast.accelerator); // 'gpu', or 'cpu' after a fallback
+```
+
 ## Async jobs
 
 ```js
@@ -71,7 +85,11 @@ API failures reject with `EtchvError` or a subclass such as
 `AuthenticationError`, `PermissionDeniedError`, `ConflictError`, `GoneError`,
 `InvalidRequestError`, `RateLimitError` or `EtchvTimeoutError`. Each carries
 `statusCode`, `detail` and `requestId` (quote it to support). Messages never
-include your API key.
+include your API key. Embedding, video detection, async submissions and job
+results retry HTTP 429 and transient 5xx responses after `Retry-After` (up to 5 s
+per wait) until the call deadline; other calls reject with `RateLimitError` so you
+can back off. Errors also expose `code` (for example `rate_limited` or
+`concurrency_limited`), `limit` and `retryAfter` in seconds when the API sends them.
 
 ```js
 import { EtchvError } from '@etchv-labs/sdk';

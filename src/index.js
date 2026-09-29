@@ -11,12 +11,15 @@ const IDS = {
   webhook: [/^wh_[a-f0-9]{32}$/, 'webhook ID'], event: [/^evt_[a-f0-9]{64}$/, 'webhook event ID'],
   destination: [/^dst_[a-f0-9]{32}$/, 'storage destination ID'], delivery: [/^std_[a-f0-9]{64}$/, 'storage delivery ID'],
 };
+const ACCELERATORS = ['cpu', 'gpu'];
 const SECRET_TEXT = /\b(?:etchv|whsec|sk_live|sk_test)_[A-Za-z0-9_+/=-]+/g;
 
 function errorMessage(statusCode, detail) {
   const base = statusCode === 0 ? 'Etchv request timed out' : `Etchv request failed (HTTP ${statusCode})`;
   const text = typeof detail === 'string' ? detail
-    : typeof detail?.detail === 'string' ? detail.detail : typeof detail?.message === 'string' ? detail.message : '';
+    : typeof detail?.detail === 'string' ? detail.detail
+      : typeof detail?.detail?.message === 'string' ? detail.detail.message
+        : typeof detail?.message === 'string' ? detail.message : '';
   // Never echo credentials or markup from an unexpected response into an error message.
   const safe = text.includes('<') ? '' : text.replace(SECRET_TEXT, '[redacted]').replace(/\s+/g, ' ').trim().slice(0, 200);
   return safe ? `${base}: ${safe}` : base;
@@ -25,15 +28,20 @@ function errorMessage(statusCode, detail) {
 /**
  * HTTP or protocol failure returned by the Etchv API. Subclasses identify common
  * statuses; all of them carry the HTTP `statusCode`, parsed `detail` and the
- * `X-Request-ID` (`requestId`) to quote when contacting support.
+ * `X-Request-ID` (`requestId`) to quote when contacting support. `code` is the
+ * API's machine-readable error code (such as `rate_limited`) when it sends one,
+ * and `retryAfter` the `Retry-After` delay in seconds.
  */
 export class EtchvError extends Error {
-  constructor(statusCode, detail, requestId = null) {
+  constructor(statusCode, detail, requestId = null, retryAfter = null) {
     super(errorMessage(statusCode, detail));
     this.name = new.target.name;
     this.statusCode = statusCode;
     this.detail = detail;
     this.requestId = requestId;
+    this.code = typeof detail?.detail?.code === 'string' ? detail.detail.code : null;
+    this.limit = Number.isFinite(detail?.detail?.limit) ? detail.detail.limit : null;
+    this.retryAfter = retryAfter;
   }
 }
 /** HTTP 401: missing, invalid, expired or inactive API key. */
@@ -61,10 +69,19 @@ const ERRORS = {
   401: AuthenticationError, 402: PaymentRequiredError, 403: PermissionDeniedError, 404: NotFoundError,
   409: ConflictError, 410: GoneError, 413: InvalidRequestError, 422: InvalidRequestError, 429: RateLimitError,
 };
-function errorFor(statusCode, detail, requestId) {
+function errorFor(statusCode, detail, requestId, retryAfter = null) {
   const Type = ERRORS[statusCode] || (statusCode >= 500 ? ServiceUnavailableError : EtchvError);
-  return new Type(statusCode, detail, requestId);
+  return new Type(statusCode, detail, requestId, retryAfter);
 }
+
+// Retry-After as seconds (delta-seconds or HTTP date), or null when absent or invalid.
+function retryAfterSeconds(value) {
+  if (!value) return null;
+  const seconds = /^\s*\d+(?:\.\d+)?\s*$/.test(value) ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
+  return Number.isFinite(seconds) ? Math.max(0, seconds) : null;
+}
+// Wait before retrying: Retry-After clamped to 0.01–5 s, or 1 s without one.
+const retryDelay = response => Math.min(5, Math.max(0.01, retryAfterSeconds(response.headers.get('retry-after')) ?? 1));
 
 function checkId(kind, value) {
   const [pattern, label] = IDS[kind];
@@ -130,7 +147,7 @@ export class Etchv {
     return { 'X-API-Key': this.#apiKey, 'User-Agent': this.#userAgent, ...extra };
   }
 
-  async #post(path, file, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey, signal, timeout } = {}, data) {
+  async #post(path, file, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey, accelerator, signal, timeout } = {}, data) {
     if (!(file instanceof Uint8Array) || !file.byteLength || file.byteLength > 50 * 1024 * 1024) {
       throw new TypeError('file must be a Buffer or Uint8Array containing 1 byte to 50 MB');
     }
@@ -145,6 +162,10 @@ export class Etchv {
       const params = new URLSearchParams({ storage_destination_id: storageDestinationId });
       if (storageKey != null) params.set('storage_key', storageKey);
       path += (path.includes('?') ? '&' : '?') + params;
+    }
+    if (accelerator != null) {
+      if (!ACCELERATORS.includes(accelerator)) throw new TypeError("accelerator must be 'cpu' or 'gpu'");
+      path += (path.includes('?') ? '&' : '?') + new URLSearchParams({ accelerator });
     }
     const form = new FormData();
     form.append('file', new Blob([file], { type: 'application/octet-stream' }), filename);
@@ -213,15 +234,15 @@ export class Etchv {
         // Construct a trusted local path; never send API keys to a server-supplied URL.
         path = `watermarks/${detectionJob ? 'detection-jobs' : 'jobs'}/${requestId}/result`;
         init = { method: 'GET', headers: this.#headers() };
-        const wait = Number(response.headers.get('retry-after') || 1);
-        await pause(Number.isFinite(wait) ? Math.min(5, Math.max(0.01, wait)) : 1);
+        await pause(retryDelay(response));
         continue;
       }
       if (durable && [429, 502, 503, 504].includes(response.status) && detail?.status !== 'failed') {
-        await pause();
+        // Honor Retry-After (capped at 5 s); pause() never waits past the deadline.
+        await pause(response.status === 429 ? retryDelay(response) : 1);
         continue;
       }
-      throw errorFor(response.status, detail, requestId);
+      throw errorFor(response.status, detail, requestId, retryAfterSeconds(response.headers.get('retry-after')));
     }
     throw expired();
   }
@@ -430,7 +451,7 @@ export class Etchv {
       throw new EtchvError(200, 'Invalid embedding response', requestId);
     }
     const filename = response.headers.get('content-disposition')?.match(/filename="([A-Za-z0-9._-]+)"/)?.[1] || `image-watermarked.${extension}`;
-    return { image: result, watermarkId, requestId, contentType, filename, assetId: response.headers.get('x-asset-id'), sourceAssetId: response.headers.get('x-source-asset-id'), storageDeliveryId: response.headers.get('x-storage-delivery-id') };
+    return { image: result, watermarkId, requestId, contentType, filename, assetId: response.headers.get('x-asset-id'), sourceAssetId: response.headers.get('x-source-asset-id'), storageDeliveryId: response.headers.get('x-storage-delivery-id'), accelerator: acceleratorUsed(response.headers.get('x-etchv-accelerator')) };
   }
 
   // Synchronous detection
@@ -462,10 +483,16 @@ export class Etchv {
       throw new EtchvError(200, 'Invalid detection units', requestId);
     }
     const units = rawUnits.map(unit => ({ index: unit.index, watermarked: unit.watermarked, confidence: unit.confidence, watermarkId: unit.watermark_id }));
-    return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId, units };
+    const accelerator = acceleratorUsed(response.headers.get('x-etchv-accelerator')) ?? acceleratorUsed(result.accelerator);
+    return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId, units, accelerator };
   }
 }
 
+// The processor that actually ran ('cpu' or 'gpu'), or null when absent or unrecognized.
+const acceleratorUsed = value => {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return ACCELERATORS.includes(normalized) ? normalized : null;
+};
 const validId = value => typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
 
 function fileExtension(bytes, mime) {
