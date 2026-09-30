@@ -9,7 +9,7 @@ detect invisible forensic watermarks in images, PDFs and videos.
 npm install @etchv-labs/sdk
 ```
 
-Requires Node.js 24.x. Works with ES modules and CommonJS (`require`), ships
+Requires Node.js 22.12 or later. Works with ES modules and CommonJS (`require`), ships
 TypeScript declarations, and has no runtime dependencies.
 
 ## Quickstart
