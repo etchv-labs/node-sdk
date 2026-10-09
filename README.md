@@ -34,8 +34,23 @@ console.log(detection.watermarked, detection.watermarkId, detection.confidence);
 
 Use `embedDocument` / `detectDocument` for PDFs and `embedVideo` / `detectVideo`
 for MP4/MOV. Image uploads are limited to 50 MB; PDF and video uploads to 20 MB.
-Detection recovers a SHA-256 digest of your data, not the data itself. Every
-method accepts `signal` and `timeout`.
+Detection takes the files Etchv delivered: up to 192 MB for images, 64 MB for
+PDFs and 100 MB for video. Detection recovers a SHA-256 digest of your data, not
+the data itself. Every method accepts `signal` and `timeout`.
+
+## Large files
+
+Files over 40 MB are uploaded once to a signed URL and then referenced by ID,
+so the request never carries the file. This is automatic in every embed,
+detect and submit method; retries reuse the same upload. Image and PDF
+detection above 95 MB runs as a background job and the call waits for it.
+Change the threshold with `new Etchv({ ..., largeFileThreshold })`, or upload
+explicitly:
+
+```js
+const upload = await client.uploadFile('detect', delivered, { filename: 'delivered.tiff' });
+upload.upload_id; // send as the upload_id form field instead of file
+```
 
 ## GPU processing
 

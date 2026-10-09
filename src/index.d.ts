@@ -1,5 +1,7 @@
 /** SDK version. Sent in the `User-Agent` header of every request. */
 export declare const VERSION: string;
+/** Default `largeFileThreshold`: 40 MB. */
+export declare const LARGE_FILE_THRESHOLD: number;
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 export type Media = 'images' | 'documents' | 'videos';
@@ -173,11 +175,25 @@ export interface EtchvOptions {
   timeout?: number;
   /** Custom fetch implementation, e.g. for tests. */
   fetch?: typeof globalThis.fetch;
+  /** Files above this many bytes go through an upload session instead of the request body (default 40 MB). */
+  largeFileThreshold?: number;
+}
+
+export type UploadKind = 'image' | 'document' | 'video' | 'detect';
+export interface UploadSession {
+  upload_id: string; kind: UploadKind; filename: string; size: number;
+  status: 'pending' | 'received' | 'consumed' | 'rejected' | 'expired'; expires_at: string;
 }
 
 /** Server-side Etchv API client. */
 export declare class Etchv {
   constructor(options: EtchvOptions);
+
+  /**
+   * Upload a file once to a signed URL; pass the returned `upload_id` instead of the file.
+   * Embed and detect methods do this automatically above `largeFileThreshold`.
+   */
+  uploadFile(kind: UploadKind, file: Uint8Array, options?: CallOptions & { filename?: string }): Promise<UploadSession>;
 
   /** Validate the API key without consuming credits (`GET /auth/api-key`). */
   getApiKeyInfo(options?: CallOptions): Promise<ApiKeyInfo>;

@@ -1,9 +1,15 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.0.2';
+export const VERSION = '1.1.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
+const MB = 1024 * 1024;
+export const LARGE_FILE_THRESHOLD = 40 * MB;
+const EMBED_MAX_BYTES = 50 * MB;
+const DETECT_MAX_BYTES = 192 * MB;
+const SYNC_DETECT_MAX_BYTES = 95 * MB;
+const UPLOAD_KINDS = { images: 'image', documents: 'document', videos: 'video' };
 const FILENAMES = { images: 'image.png', documents: 'document.pdf', videos: 'video.mp4' };
 const DURABLE = ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'];
 const IDS = {
@@ -120,14 +126,17 @@ export class Etchv {
   #timeout;
   #fetch;
   #userAgent;
+  #largeFileThreshold;
   /**
    * @param {object} options
    * @param {string} options.apiKey Organization API key.
    * @param {string} [options.baseUrl] API origin (default `https://api.etchv.com`). HTTPS only, except localhost.
    * @param {number} [options.timeout] Per-call deadline in milliseconds (default 120000).
    * @param {typeof fetch} [options.fetch] Custom fetch implementation, e.g. for tests.
+   * @param {number} [options.largeFileThreshold] Files above this many bytes go through an upload session (default 40 MB).
    */
-  constructor({ apiKey, baseUrl = 'https://api.etchv.com', timeout = 120000, fetch: fetchImpl = globalThis.fetch } = {}) {
+  constructor({ apiKey, baseUrl = 'https://api.etchv.com', timeout = 120000, fetch: fetchImpl = globalThis.fetch,
+    largeFileThreshold = LARGE_FILE_THRESHOLD } = {}) {
     if (typeof apiKey !== 'string' || !apiKey.trim()) throw new TypeError('apiKey is required');
     const url = new URL(baseUrl);
     if (url.username || url.password || url.search || url.hash ||
@@ -136,6 +145,8 @@ export class Etchv {
     }
     if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new TypeError('timeout must be a positive integer');
     if (typeof fetchImpl !== 'function') throw new TypeError('fetch must be a function');
+    if (!Number.isSafeInteger(largeFileThreshold) || largeFileThreshold < 1) throw new TypeError('largeFileThreshold must be a positive integer');
+    this.#largeFileThreshold = largeFileThreshold;
     this.#apiKey = apiKey;
     this.#baseUrl = baseUrl.replace(/\/+$/, '') + '/';
     this.#timeout = timeout;
@@ -148,8 +159,10 @@ export class Etchv {
   }
 
   async #post(path, file, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey, accelerator, signal, timeout } = {}, data) {
-    if (!(file instanceof Uint8Array) || !file.byteLength || file.byteLength > 50 * 1024 * 1024) {
-      throw new TypeError('file must be a Buffer or Uint8Array containing 1 byte to 50 MB');
+    const detect = path.split('?')[0].includes('/detect');
+    const limit = detect ? DETECT_MAX_BYTES : EMBED_MAX_BYTES;
+    if (!(file instanceof Uint8Array) || !file.byteLength || file.byteLength > limit) {
+      throw new TypeError(`file must be a Buffer or Uint8Array containing 1 byte to ${limit / MB} MB`);
     }
     if (typeof filename !== 'string' || !filename) throw new TypeError('filename must be a non-empty string');
     if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(idempotencyKey))) {
@@ -168,7 +181,14 @@ export class Etchv {
       path += (path.includes('?') ? '&' : '?') + new URLSearchParams({ accelerator });
     }
     const form = new FormData();
-    form.append('file', new Blob([file], { type: 'application/octet-stream' }), filename);
+    if (file.byteLength > this.#largeFileThreshold) {
+      // Too large for one request body: upload once; every retry sends the same upload_id.
+      const kind = detect ? 'detect' : UPLOAD_KINDS[path.split('/')[1]];
+      const upload = await this.uploadFile(kind, file, { filename, signal, timeout });
+      form.append('upload_id', upload.upload_id);
+    } else {
+      form.append('file', new Blob([file], { type: 'application/octet-stream' }), filename);
+    }
     if (data !== undefined) form.append('data', data);
     const route = path.split('?')[0];
     const accepted = route.endsWith('/async');
@@ -269,6 +289,50 @@ export class Etchv {
     if (!MEDIA.includes(media)) throw new TypeError('media must be images, documents or videos');
     if (webhookId != null) checkId('webhook', webhookId);
     return `watermarks/${media}${detect ? '/detect' : ''}/async${webhookId ? '?webhook_id=' + webhookId : ''}`;
+  }
+
+  // Upload sessions
+
+  /**
+   * Upload a file once to a signed URL and return its session (`upload_id`, `status`).
+   * `kind` is `image`, `document`, `video` or `detect`. Embed and detect methods do this
+   * automatically above `largeFileThreshold`.
+   */
+  async uploadFile(kind, file, { filename = 'file', signal, timeout = this.#timeout } = {}) {
+    if (!['image', 'document', 'video', 'detect'].includes(kind)) throw new TypeError("kind must be 'image', 'document', 'video' or 'detect'");
+    if (!(file instanceof Uint8Array) || !file.byteLength) throw new TypeError('file must be a Buffer or Uint8Array with at least 1 byte');
+    const deadline = Date.now() + timeout;
+    const session = await this.#json('uploads', { method: 'POST', body: { kind, filename, size: file.byteLength }, signal, timeout });
+    const upload = session?.upload;
+    if (!upload || upload.method !== 'PUT' || !String(upload.url).startsWith('https://')) {
+      throw new EtchvError(201, 'Invalid upload session response', null);
+    }
+    while (true) {
+      let response;
+      try {
+        // The signed URL carries its own authorization: never send the API key there.
+        response = await this.#fetch(upload.url, {
+          method: 'PUT', body: file, redirect: 'manual',
+          headers: { 'Content-Type': 'application/octet-stream', 'User-Agent': this.#userAgent },
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))])
+            : AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        });
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason;
+        if (Date.now() >= deadline) throw new EtchvTimeoutError(0, { message: 'Client deadline exceeded' }, null);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      if (response.status === 200) {
+        const { upload: _, ...rest } = session;
+        return { ...rest, status: 'received' };
+      }
+      if ([500, 502, 503, 504].includes(response.status) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      throw errorFor(response.status, (await response.text()).slice(0, 1000) || 'Upload refused', null);
+    }
   }
 
   // Connection check
@@ -464,6 +528,11 @@ export class Etchv {
   async detectVideo(video, options = {}) { return this.#detect('videos', video, { filename: 'video.mp4', ...options }); }
   async #detect(media, file, options) {
     if (options.storageDestinationId != null || options.storageKey != null) throw new TypeError('Storage destinations apply to embedding jobs only');
+    if (media !== 'videos' && file instanceof Uint8Array && file.byteLength > SYNC_DETECT_MAX_BYTES) {
+      // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
+      const receipt = await this.submitDetection(media, file, options);
+      return this.getDetectionResult(receipt.request_id, callOptions(options));
+    }
     return this.#detectionResult(await this.#post(`watermarks/${media}/detect`, file, options));
   }
   async #detectionResult(response) {
