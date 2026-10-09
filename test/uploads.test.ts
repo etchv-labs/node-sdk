@@ -19,7 +19,8 @@ test('large embeds upload once, without the API key, then send the upload_id', a
     }
     if (target.host === 'uploads.etchv.com') {
       assert.equal(init.headers['X-API-Key'], undefined);
-      assert.deepEqual(init.body, png);
+      assert.equal(init.headers['Content-Length'], String(png.byteLength));
+      assert.deepEqual(new Uint8Array(await new Response(init.body).arrayBuffer()), png);
       return new Response(null, { status: 200 });
     }
     assert.equal(init.body.get('file'), null);

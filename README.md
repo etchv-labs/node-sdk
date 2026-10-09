@@ -79,6 +79,61 @@ const file = await client.getEmbedResult(job.request_id); // waits for the file
 the same way. Reusing an `idempotencyKey` with the same input returns the saved
 result (kept 24 hours) without another charge.
 
+## Many files at once
+
+A batch watermarks up to 100 images, PDFs and videos with one call.
+`submitBatch` creates the batch, uploads every file to its own signed URL
+(four at a time, never with your API key) and starts it. Each item has its own
+forensic data; the filename's extension sets the media type.
+
+```js
+import { basename } from 'node:path';
+
+const files = ['in/acme.pdf', 'in/globex.pdf'];
+const batch = await client.submitBatch(
+  files.map(file => ({ filename: basename(file), file, data: { recipient: basename(file, '.pdf') } })),
+  { archive: true }, // also zip every result into one download
+);
+await client.waitForBatch(batch.batch_id, { timeout: 30 * 60_000 }); // honors Retry-After between polls
+
+for await (const item of client.iterBatchResults(batch.batch_id)) {
+  if (item.ok) await writeFile(`out/${item.result.filename}`, item.result.image);
+  else console.log(item.filename, item.errorCode); // not charged, or refunded
+}
+
+await client.downloadBatchArchiveTo(batch.batch_id, 'out.zip'); // streams to disk
+```
+
+`file` is a Buffer/Uint8Array or a file path. A batch costs the same credits
+per file as single requests. Files that never arrive or fail their checks are
+rejected (`upload_not_received`, `invalid_input`, ...) without a charge, and
+failed files are refunded, so one bad file never stops the rest. Results are
+kept 24 hours; the archive (with `archive: true`) holds every successful result
+plus `manifest.json` and is limited to 1 GB. `downloadBatchArchiveTo` streams it
+to a path or writable stream; `downloadBatchArchive` returns a `Uint8Array`.
+
+More than 100 items reject with a `RangeError` before any request; split larger
+sets into several batches. Pass `webhookId` to get one
+`watermark.batch.completed`, `watermark.batch.failed` or
+`watermark.batch.cancelled` event when the batch ends, and `accelerator` or
+`storageDestinationId` as for single files. Retries reuse the same
+`idempotencyKey` (generated when omitted). If an upload or the start still
+fails, `BatchSubmitError` carries `batchId` and `idempotencyKey`; calling
+`submitBatch` again with that key and the same items uploads only the files that
+have not arrived and starts the batch. A batch not started within 24 hours
+expires, and resuming it rejects with `GoneError`.
+
+Files already in one zip (up to 55 MB) can go in one request; list every
+member:
+
+```js
+const zipped = await client.submitBatchZip('in.zip', [{ filename: 'in/a.png', data: { recipient: 'a' } }]);
+```
+
+Also: `getBatch`, `cancelBatch` (files still waiting are canceled and
+refunded; queued and running files finish) and
+`listBatches({ limit, before })`.
+
 ## Also included
 
 - API key check: `getApiKeyInfo()` (no credits used).

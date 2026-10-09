@@ -1,7 +1,9 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { once } from 'node:events';
+import { open, readFile, rename, rm, stat } from 'node:fs/promises';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const MB = 1024 * 1024;
@@ -9,6 +11,15 @@ export const LARGE_FILE_THRESHOLD = 40 * MB;
 const EMBED_MAX_BYTES = 50 * MB;
 const DETECT_MAX_BYTES = 192 * MB;
 const SYNC_DETECT_MAX_BYTES = 95 * MB;
+/** Most files in one batch. */
+export const MAX_BATCH_ITEMS = 100;
+const ZIP_BATCH_MAX_BYTES = 55 * MB;
+/** Slowest uplink an upload is given time for (about 1 Mbps), on top of the client timeout. */
+export const UPLOAD_MIN_BYTES_PER_SECOND = 128 * 1024;
+/** Largest batch archive the SDK accepts: 1 GiB of results plus 64 MiB for the zip itself. */
+export const ARCHIVE_MAX_BYTES = 1024 * MB + 64 * MB;
+const UPLOAD_CHUNK_BYTES = 64 * 1024;
+const FINAL_BATCH = ['completed', 'failed', 'cancelled', 'expired'];
 const UPLOAD_KINDS = { images: 'image', documents: 'document', videos: 'video' };
 const FILENAMES = { images: 'image.png', documents: 'document.pdf', videos: 'video.mp4' };
 const DURABLE = ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'];
@@ -16,6 +27,7 @@ const IDS = {
   request: [/^req_[a-f0-9]{64}$/, 'request ID'], asset: [/^ast_[a-f0-9]{64}$/, 'asset ID'],
   webhook: [/^wh_[a-f0-9]{32}$/, 'webhook ID'], event: [/^evt_[a-f0-9]{64}$/, 'webhook event ID'],
   destination: [/^dst_[a-f0-9]{32}$/, 'storage destination ID'], delivery: [/^std_[a-f0-9]{64}$/, 'storage delivery ID'],
+  batch: [/^bat_[a-f0-9]{32}$/, 'batch ID'],
 };
 const ACCELERATORS = ['cpu', 'gpu'];
 const SECRET_TEXT = /\b(?:etchv|whsec|sk_live|sk_test)_[A-Za-z0-9_+/=-]+/g;
@@ -70,6 +82,42 @@ export class RateLimitError extends EtchvError {}
 export class ServiceUnavailableError extends EtchvError {}
 /** The client deadline passed (`statusCode` 0). A durable job may still complete. */
 export class EtchvTimeoutError extends EtchvError {}
+/**
+ * `submitBatch` failed after the batch was created: an upload (or the start) could not
+ * complete. `batchId` and `idempotencyKey` are always set: call `submitBatch` again with
+ * that `idempotencyKey` and the same items to upload what is missing and start. `statusCode`
+ * is the HTTP status, or 0 for a network error, timeout or unreadable file (see `cause`).
+ */
+export class BatchSubmitError extends EtchvError {
+  constructor(statusCode, detail, requestId = null, retryAfter = null) {
+    super(statusCode, detail, requestId, retryAfter);
+    const inner = detail?.detail ?? {};
+    if (typeof inner.message === 'string') this.message = `Etchv batch submission failed: ${inner.message}`;
+    this.batchId = inner.batch_id ?? null;
+    this.idempotencyKey = inner.idempotency_key ?? null;
+    this.index = inner.index ?? null;
+    this.filename = inner.filename ?? null;
+  }
+}
+
+// An abort through `signal` after the batch exists: keep the reason's name (usually
+// 'AbortError') so abort checks still work, and attach what is needed to resume.
+function abortError(reason, batchId, key) {
+  const error = submitError(reason, batchId, key, 'batch_aborted', 'Submitting the batch was aborted');
+  error.name = typeof reason?.name === 'string' ? reason.name : 'AbortError';
+  return error;
+}
+
+function submitError(error, batchId, key, code, what, index, filename) {
+  const statusCode = error instanceof EtchvError ? error.statusCode : 0;
+  const reason = statusCode ? `HTTP ${statusCode}` : (error?.code || error?.name || 'error');
+  const detail = { code, batch_id: batchId, idempotency_key: key,
+    message: `${what} (${reason}); call submitBatch again with idempotencyKey '${key}' and the same items to resume` };
+  if (index !== undefined) Object.assign(detail, { index, filename });
+  const wrapped = new BatchSubmitError(statusCode, { detail }, error?.requestId ?? null, error?.retryAfter ?? null);
+  wrapped.cause = error;
+  return wrapped;
+}
 
 const ERRORS = {
   401: AuthenticationError, 402: PaymentRequiredError, 403: PermissionDeniedError, 404: NotFoundError,
@@ -115,6 +163,71 @@ function encodeData(data) {
 }
 
 const callOptions = ({ signal, timeout } = {}) => ({ signal, timeout });
+
+const archiveTooLarge = requestId => new EtchvError(200, { detail: { code: 'archive_too_large',
+  message: `The archive is larger than ${ARCHIVE_MAX_BYTES / MB} MiB; download each item's result instead` } }, requestId);
+
+function concatBytes(a, b) {
+  const joined = new Uint8Array(a.byteLength + b.byteLength);
+  joined.set(a); joined.set(b, a.byteLength);
+  return joined;
+}
+
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason);
+  const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+  const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, Math.max(0, ms));
+  signal?.addEventListener('abort', onAbort, { once: true });
+});
+
+function batchKey(key) {
+  if (key === undefined) return globalThis.crypto.randomUUID();
+  if (typeof key !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(key)) {
+    throw new TypeError('idempotencyKey must contain 8–128 letters, digits, hyphens or underscores');
+  }
+  return key;
+}
+
+function checkBatchCount(items) {
+  if (!Array.isArray(items)) throw new TypeError('items must be an array of batch items');
+  if (items.length < 1 || items.length > MAX_BATCH_ITEMS) {
+    throw new RangeError(`A batch takes 1 to ${MAX_BATCH_ITEMS} files; got ${items.length}. Split larger sets into several batches.`);
+  }
+}
+
+function batchData(data, filename) {
+  try { encodeData(data); } catch (error) { throw new TypeError(`${filename}: ${error.message}`); }
+  return data;
+}
+
+async function batchFiles(items) {
+  checkBatchCount(items);
+  return Promise.all(items.map(async (item) => {
+    if (!item || typeof item.filename !== 'string' || !item.filename) throw new TypeError('Each batch item needs a filename, a file and data');
+    const { filename, file } = item;
+    let size;
+    if (file instanceof Uint8Array) size = file.byteLength;
+    else if (typeof file === 'string' && file) size = (await stat(file)).size;
+    else throw new TypeError(`${filename}: file must be a Buffer, Uint8Array or file path`);
+    if (size < 1) throw new TypeError(`${filename}: file is empty`);
+    return { filename, file, size, data: batchData(item.data, filename) };
+  }));
+}
+
+function batchOptions({ archive, webhookId, accelerator, storageDestinationId }) {
+  if (typeof archive !== 'boolean') throw new TypeError('archive must be a boolean');
+  const options = { archive };
+  if (webhookId != null) options.webhook_id = checkId('webhook', webhookId);
+  if (accelerator != null) {
+    if (!ACCELERATORS.includes(accelerator)) throw new TypeError("accelerator must be 'cpu' or 'gpu'");
+    options.accelerator = accelerator;
+  }
+  if (storageDestinationId != null) {
+    if (archive) throw new TypeError('archive and storageDestinationId cannot be combined');
+    options.storage_destination_id = checkId('destination', storageDestinationId);
+  }
+  return options;
+}
 
 /**
  * Server-side client for the Etchv API. Authenticates with an `X-API-Key`.
@@ -199,7 +312,7 @@ export class Etchv {
     return this.#request(path, { method: 'POST', headers, body: form }, { durable, accepted, idempotencyKey: key, signal, timeout });
   }
 
-  async #request(path, init, { durable = false, accepted = false, idempotencyKey, signal, timeout = this.#timeout } = {}) {
+  async #request(path, init, { durable = false, accepted = false, retry = [429, 502, 503, 504], idempotencyKey, signal, timeout = this.#timeout } = {}) {
     if (signal != null && !(signal instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
     if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new TypeError('timeout must be a positive integer');
     signal?.throwIfAborted();
@@ -257,7 +370,7 @@ export class Etchv {
         await pause(retryDelay(response));
         continue;
       }
-      if (durable && [429, 502, 503, 504].includes(response.status) && detail?.status !== 'failed') {
+      if (durable && retry.includes(response.status) && detail?.status !== 'failed') {
         // Honor Retry-After (capped at 5 s); pause() never waits past the deadline.
         await pause(response.status === 429 ? retryDelay(response) : 1);
         continue;
@@ -301,34 +414,63 @@ export class Etchv {
   async uploadFile(kind, file, { filename = 'file', signal, timeout = this.#timeout } = {}) {
     if (!['image', 'document', 'video', 'detect'].includes(kind)) throw new TypeError("kind must be 'image', 'document', 'video' or 'detect'");
     if (!(file instanceof Uint8Array) || !file.byteLength) throw new TypeError('file must be a Buffer or Uint8Array with at least 1 byte');
-    const deadline = Date.now() + timeout;
     const session = await this.#json('uploads', { method: 'POST', body: { kind, filename, size: file.byteLength }, signal, timeout });
     const upload = session?.upload;
     if (!upload || upload.method !== 'PUT' || !String(upload.url).startsWith('https://')) {
       throw new EtchvError(201, 'Invalid upload session response', null);
     }
+    await this.#put(upload.url, file, { signal, timeout });
+    const { upload: _, ...rest } = session;
+    return { ...rest, status: 'received' };
+  }
+
+  // A PUT is aborted only when no bytes move (and no response arrives) for `timeout`: the
+  // body is streamed in chunks and each chunk taken by the connection resets the watchdog,
+  // so slow but steady uploads finish. Retries stop after `timeout` plus the time the file
+  // needs at UPLOAD_MIN_BYTES_PER_SECOND.
+  async #put(url, file, { signal, timeout = this.#timeout }) {
+    const deadline = Date.now() + timeout + Math.ceil(file.byteLength * 1000 / UPLOAD_MIN_BYTES_PER_SECOND);
     while (true) {
+      signal?.throwIfAborted(); // A listener never fires for a signal that is already aborted.
       let response;
+      const controller = new AbortController();
+      let timer;
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => controller.abort(new DOMException('No upload progress within the client timeout', 'TimeoutError')), timeout);
+      };
+      const onAbort = () => controller.abort(signal.reason);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) controller.abort(signal.reason);
+      let offset = 0;
+      const body = new ReadableStream({
+        pull(stream) {
+          arm();
+          if (offset >= file.byteLength) return stream.close();
+          const end = Math.min(offset + UPLOAD_CHUNK_BYTES, file.byteLength);
+          stream.enqueue(file.slice(offset, end));
+          offset = end;
+        },
+      }, { highWaterMark: 0 });
+      arm();
       try {
         // The signed URL carries its own authorization: never send the API key there.
-        response = await this.#fetch(upload.url, {
-          method: 'PUT', body: file, redirect: 'manual',
-          headers: { 'Content-Type': 'application/octet-stream', 'User-Agent': this.#userAgent },
-          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))])
-            : AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        response = await this.#fetch(url, {
+          method: 'PUT', body, duplex: 'half', redirect: 'manual', signal: controller.signal,
+          headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(file.byteLength), 'User-Agent': this.#userAgent },
         });
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
         if (Date.now() >= deadline) throw new EtchvTimeoutError(0, { message: 'Client deadline exceeded' }, null);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await sleep(1000, signal);
         continue;
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
       }
-      if (response.status === 200) {
-        const { upload: _, ...rest } = session;
-        return { ...rest, status: 'received' };
-      }
+      if (response.status === 200) return;
       if ([500, 502, 503, 504].includes(response.status) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await sleep(1000, signal);
         continue;
       }
       throw errorFor(response.status, (await response.text()).slice(0, 1000) || 'Upload refused', null);
@@ -372,6 +514,342 @@ export class Etchv {
     checkId('request', requestId);
     return this.#detectionResult(await this.#request(`watermarks/detection-jobs/${requestId}/result`,
       { method: 'GET', headers: this.#headers() }, { durable: true, ...callOptions(options) }));
+  }
+
+  // Batches
+
+  /**
+   * Watermark up to 100 files as one batch and resolve with it once started: creates the
+   * batch, uploads every file to its signed URL (`uploadConcurrency` at a time, never with
+   * the API key), then starts it. `file` is a Buffer/Uint8Array or a file path. Transient
+   * failures are retried with the same `idempotencyKey` (generated when omitted). If an
+   * upload or the start fails for good, `BatchSubmitError` carries `batchId` and
+   * `idempotencyKey`: call again with that key and the same items to upload the rest and
+   * start. Resuming a batch that was not started within 24 hours rejects with `GoneError`
+   * (`code` `batch_expired`).
+   */
+  async submitBatch(items, { archive = false, webhookId, accelerator, storageDestinationId, idempotencyKey,
+    uploadConcurrency = 4, signal, timeout } = {}) {
+    const files = await batchFiles(items);
+    if (!Number.isSafeInteger(uploadConcurrency) || uploadConcurrency < 1 || uploadConcurrency > 16) {
+      throw new TypeError('uploadConcurrency must be an integer from 1 to 16');
+    }
+    const key = batchKey(idempotencyKey);
+    const body = { items: files.map(({ filename, size, data }) => ({ filename, size, data })),
+      ...batchOptions({ archive, webhookId, accelerator, storageDestinationId }) };
+    // 503 means batch uploads are unavailable: reject at once (submitBatchZip still works).
+    const { batch } = await this.#batchRequest('watermarks/batches', {
+      method: 'POST', body: encodeJson(body), key, retry: [429, 502, 504], signal, timeout });
+    if (batch.status === 'expired') {
+      throw new GoneError(410, { detail: { code: 'batch_expired', batch_id: batch.batch_id, idempotency_key: key,
+        message: 'This batch was not started within 24 hours and expired; submit the files again with a new idempotencyKey' } }, null);
+    }
+    if (batch.status !== 'draft') return batch; // A replay of a batch that already started (or was canceled).
+    const uploads = [];
+    for (const item of batch.items ?? []) {
+      if (item?.upload == null || item.upload_received === true) continue; // Already uploaded (a resumed batch).
+      if (!Number.isSafeInteger(item.index) || !files[item.index] || item.upload.method !== 'PUT' ||
+        !String(item.upload.url).startsWith('https://')) throw new EtchvError(201, 'Invalid batch upload response', null);
+      uploads.push([item.index, item.upload.url]);
+    }
+    await this.#uploadBatch(batch.batch_id, key, files, uploads, uploadConcurrency, { signal, timeout });
+    try {
+      return (await this.#batchRequest(`watermarks/batches/${batch.batch_id}/start`, { method: 'POST', accepted: true, signal, timeout })).batch;
+    } catch (error) {
+      // Definitive refusals (for example 410 when the draft expired) and aborts pass through.
+      if (signal?.aborted) throw abortError(signal.reason, batch.batch_id, key);
+      if (error instanceof EtchvError && error.statusCode >= 400 && error.statusCode < 500) throw error;
+      throw submitError(error, batch.batch_id, key, 'batch_start_failed', 'Starting the batch failed');
+    }
+  }
+
+  async #uploadBatch(batchId, key, files, uploads, concurrency, { signal, timeout = this.#timeout }) {
+    let next = 0;
+    let failure = null;
+    const worker = async () => {
+      while (next < uploads.length && !failure) {
+        if (signal?.aborted) {
+          failure ??= abortError(signal.reason, batchId, key);
+          break;
+        }
+        const [index, url] = uploads[next++];
+        const { filename, file, size } = files[index];
+        try {
+          const bytes = typeof file === 'string' ? await readFile(file) : file;
+          signal?.throwIfAborted();
+          if (bytes.byteLength !== size) throw new TypeError(`${filename} changed size after the batch was created`);
+          await this.#put(url, bytes, { signal, timeout });
+        } catch (error) {
+          failure ??= signal?.aborted ? abortError(signal.reason, batchId, key)
+            : submitError(error, batchId, key, 'batch_upload_failed', `Uploading ${filename} (item ${index}) failed`, index, filename);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, uploads.length) }, worker));
+    if (failure) throw failure;
+  }
+
+  /**
+   * Create and start a batch from one zip (up to 55 MB) of files already together. `items`
+   * lists every member as `{ filename: <exact member path>, data }`. Retried like `submitBatch`.
+   */
+  async submitBatchZip(zip, items, { archive = false, webhookId, accelerator, storageDestinationId, idempotencyKey, signal, timeout } = {}) {
+    const bytes = typeof zip === 'string' ? await readFile(zip) : zip;
+    if (!(bytes instanceof Uint8Array) || bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes.byteLength > ZIP_BATCH_MAX_BYTES) {
+      throw new TypeError(`zip must be a zip of up to ${ZIP_BATCH_MAX_BYTES / MB} MB (bytes or a file path)`);
+    }
+    checkBatchCount(items);
+    const members = items.map((item) => {
+      if (!item || typeof item.filename !== 'string' || !item.filename) throw new TypeError('Each zip item needs a filename (the member path in the zip) and data');
+      return { filename: item.filename, data: batchData(item.data, item.filename) };
+    });
+    const form = new FormData();
+    form.append('archive', new Blob([bytes], { type: 'application/zip' }), 'batch.zip');
+    form.append('manifest', encodeJson({ items: members, ...batchOptions({ archive, webhookId, accelerator, storageDestinationId }) }));
+    return (await this.#batchRequest('watermarks/batches/zip', {
+      method: 'POST', form, key: batchKey(idempotencyKey), accepted: true, signal, timeout })).batch;
+  }
+
+  async #batchRequest(path, { method = 'GET', body, form, key, accepted = false, retry, signal, timeout } = {}) {
+    const headers = this.#headers(body === undefined ? {} : { 'Content-Type': 'application/json' });
+    if (key !== undefined) headers['Idempotency-Key'] = key;
+    const response = await this.#request(path, { method, headers, ...((body ?? form) !== undefined ? { body: body ?? form } : {}) },
+      { durable: true, accepted, idempotencyKey: key, signal, timeout, ...(retry ? { retry } : {}) });
+    let batch;
+    try { batch = await response.json(); } catch { batch = null; }
+    if (!batch || !IDS.batch[0].test(batch.batch_id) || typeof batch.status !== 'string' ||
+      (batch.items !== undefined && !Array.isArray(batch.items))) {
+      throw new EtchvError(response.status, 'Invalid batch response', response.headers.get('x-request-id'));
+    }
+    return { batch, retryAfter: retryAfterSeconds(response.headers.get('retry-after')) };
+  }
+
+  /** Read a batch with every item's status (one request; see `waitForBatch` to poll). */
+  async getBatch(batchId, options = {}) {
+    return (await this.#batchRequest(`watermarks/batches/${checkId('batch', batchId)}`, callOptions(options))).batch;
+  }
+
+  /**
+   * Poll a batch until it is final (`completed`, `failed`, `cancelled` or `expired`) and
+   * resolve with it. Waits as long as the API's `Retry-After` asks between polls (or
+   * `pollInterval` ms, whichever is longer). `timeout` bounds the whole wait (default one
+   * hour); then it rejects with `EtchvTimeoutError` and the batch keeps running.
+   */
+  async waitForBatch(batchId, { timeout = 3_600_000, pollInterval, signal } = {}) {
+    checkId('batch', batchId);
+    if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new TypeError('timeout must be a positive integer');
+    if (pollInterval != null && (!Number.isFinite(pollInterval) || pollInterval <= 0)) throw new TypeError('pollInterval must be a positive number of milliseconds');
+    const deadline = Date.now() + timeout;
+    while (true) {
+      const { batch, retryAfter } = await this.#batchRequest(`watermarks/batches/${batchId}`, { signal });
+      if (FINAL_BATCH.includes(batch.status)) return batch;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new EtchvTimeoutError(0, { message: 'Client deadline exceeded; the batch is still running', batchId, status: batch.status }, null);
+      }
+      const delay = retryAfter != null ? Math.max(1, retryAfter) * 1000 : (pollInterval ?? 2000);
+      await sleep(Math.min(Math.max(delay, pollInterval ?? 0), remaining), signal);
+    }
+  }
+
+  /**
+   * Wait for a batch to finish, then yield one result per item in order. Succeeded items
+   * carry the verified file in `result` (downloaded as you iterate; results are kept 24
+   * hours); others carry `errorCode` and were refunded or never charged.
+   */
+  async *iterBatchResults(batchId, options = {}) {
+    const batch = await this.waitForBatch(batchId, options);
+    for (const item of batch.items ?? []) {
+      const base = { index: item.index, filename: item.filename, status: item.status, requestId: item.request_id ?? null };
+      if (item.status === 'succeeded' && item.request_id) {
+        yield { ...base, ok: true, result: await this.getEmbedResult(item.request_id, { signal: options.signal }), errorCode: null, errorDetail: null };
+      } else {
+        const errorCode = item.error_code ?? (['cancelled', 'expired'].includes(batch.status) ? batch.status : item.status);
+        yield { ...base, ok: false, result: null, errorCode, errorDetail: item.error_detail ?? null };
+      }
+    }
+  }
+
+  /**
+   * Wait for and download the zip of a batch created with `archive: true`: every successful
+   * result plus `manifest.json`. It can reach 1 GB; `downloadBatchArchiveTo` streams it to a
+   * file instead of memory. `timeout` bounds the wait for the archive (default one hour); the
+   * download itself only fails if no data arrives for the client timeout. Rejects with
+   * `ConflictError` (`code` `archive_not_requested`, `batch_not_started`, `archive_too_large`
+   * or `archive_unavailable`) or `GoneError` after 24 hours or for an expired draft, and with
+   * `EtchvError` (`code` `archive_too_large`, not retried) above `ARCHIVE_MAX_BYTES`.
+   */
+  async downloadBatchArchive(batchId, options = {}) {
+    const opened = await this.#openArchive(batchId, options);
+    const length = Number(opened.response.headers.get('content-length'));
+    let buffer = Number.isSafeInteger(length) && length > 0 ? new Uint8Array(length) : null;
+    const chunks = [];
+    let size = 0;
+    await this.#readArchive(opened, (chunk) => {
+      if (buffer && size + chunk.byteLength <= buffer.byteLength) {
+        buffer.set(chunk, size); // One allocation when the length is known.
+      } else {
+        if (buffer) { chunks.push(buffer.subarray(0, size)); buffer = null; }
+        chunks.push(chunk);
+      }
+      size += chunk.byteLength;
+    });
+    if (buffer) return size === buffer.byteLength ? buffer : buffer.slice(0, size);
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return bytes;
+  }
+
+  /**
+   * Like `downloadBatchArchive`, but streams the zip to a file path or a Node.js writable
+   * stream (which is not ended) and resolves with the number of bytes written. A path is
+   * written through a `.part` file that replaces it only once the download is complete.
+   */
+  async downloadBatchArchiveTo(batchId, destination, options = {}) {
+    if (typeof destination !== 'string' && typeof destination?.write !== 'function') {
+      throw new TypeError('destination must be a file path or a writable stream');
+    }
+    if (typeof destination !== 'string') {
+      const opened = await this.#openArchive(batchId, options);
+      return this.#readArchive(opened, async (chunk) => {
+        if (!destination.write(chunk)) await once(destination, 'drain');
+      });
+    }
+    const partial = `${destination}.part`;
+    // Open the file first so a bad path fails before any waiting.
+    let handle = await open(partial, 'w');
+    let opened;
+    try {
+      opened = await this.#openArchive(batchId, options);
+      const size = await this.#readArchive(opened, async (chunk) => { await handle.write(chunk); });
+      await handle.close();
+      handle = null;
+      await rename(partial, destination);
+      return size;
+    } catch (error) {
+      opened?.controller.abort();
+      opened?.release();
+      await handle?.close().catch(() => {});
+      await rm(partial, { force: true });
+      throw error;
+    }
+  }
+
+  // Wait until the archive is ready (202 while the batch runs) and return the open 200 response.
+  async #openArchive(batchId, { timeout = 3_600_000, signal } = {}) {
+    checkId('batch', batchId);
+    if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new TypeError('timeout must be a positive integer');
+    if (signal != null && !(signal instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
+    const deadline = Date.now() + timeout;
+    const url = new URL(`watermarks/batches/${batchId}/archive`, this.#baseUrl);
+    while (true) {
+      signal?.throwIfAborted();
+      const controller = new AbortController();
+      const onAbort = () => controller.abort(signal.reason);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      // The client timeout applies until the headers arrive, then again to each chunk.
+      let timer;
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => controller.abort(new DOMException('No data within the client timeout', 'TimeoutError')), this.#timeout);
+      };
+      const release = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
+      arm();
+      let response;
+      try {
+        response = await this.#fetch(url, { method: 'GET', headers: this.#headers(), redirect: 'manual', signal: controller.signal });
+      } catch (error) {
+        release();
+        if (signal?.aborted) throw signal.reason;
+        if (Date.now() >= deadline) throw new EtchvTimeoutError(0, { message: 'Client deadline exceeded; the archive is not ready yet', batchId }, null);
+        await sleep(1000, signal);
+        continue;
+      }
+      const requestId = response.headers.get('x-request-id');
+      const retryAfter = retryAfterSeconds(response.headers.get('retry-after'));
+      if (response.status === 200) {
+        if (Number(response.headers.get('content-length')) > ARCHIVE_MAX_BYTES) {
+          controller.abort();
+          release();
+          throw archiveTooLarge(requestId);
+        }
+        const disarm = () => clearTimeout(timer);
+        return { response, controller, requestId, arm, disarm, release, batchId };
+      }
+      let detail = '';
+      try { detail = (await response.text()).slice(0, 10000); } catch { /* Keep the status. */ } finally { release(); }
+      let delay;
+      if (response.status === 202) delay = Math.max(1, retryAfter ?? 2);
+      else if ([429, 502, 503, 504].includes(response.status)) delay = Math.max(1, Math.min(5, retryAfter ?? 1));
+      else {
+        try { detail = JSON.parse(detail); } catch { /* Preserve error text. */ }
+        throw errorFor(response.status, detail, requestId, retryAfter);
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new EtchvTimeoutError(0, { message: 'Client deadline exceeded; the archive is not ready yet', batchId }, requestId);
+      await sleep(Math.min(delay * 1000, remaining), signal);
+    }
+  }
+
+  // Stream the body to `write`, checking the zip signature; each chunk resets the idle timer.
+  async #readArchive({ response, controller, requestId, arm, disarm, release, batchId }, write) {
+    const invalid = () => new EtchvError(200, 'Invalid archive response', requestId);
+    const reader = response.body?.getReader();
+    let size = 0;
+    let head = null;
+    try {
+      if (!reader) throw invalid();
+      while (true) {
+        arm();
+        const { done, value } = await reader.read();
+        if (done) break;
+        let chunk = value;
+        if (head !== false) {
+          head = head ? concatBytes(head, value) : value;
+          if (head.byteLength < 2) continue;
+          if (head[0] !== 0x50 || head[1] !== 0x4b) throw invalid();
+          chunk = head;
+          head = false;
+        }
+        if (size + chunk.byteLength > ARCHIVE_MAX_BYTES) throw archiveTooLarge(requestId);
+        disarm(); // Time spent writing (for example waiting for 'drain') is not network idle time.
+        await write(chunk);
+        size += chunk.byteLength;
+      }
+      if (!size) throw invalid();
+      return size;
+    } catch (error) {
+      controller.abort();
+      if (error?.name === 'TimeoutError') {
+        throw new EtchvTimeoutError(0, { message: 'The archive download stalled', batchId }, requestId);
+      }
+      throw error;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Cancel a batch. A draft is canceled at once. In a started batch, files still waiting fail
+   * with error code `cancelled` and are refunded; queued and running files finish, and the
+   * batch then ends as `cancelled`.
+   */
+  async cancelBatch(batchId, options = {}) {
+    return (await this.#batchRequest(`watermarks/batches/${checkId('batch', batchId)}/cancel`, { method: 'POST', ...callOptions(options) })).batch;
+  }
+
+  /** List batches newest first (`limit` 1–50), without items. Pass `before: page.next_cursor` for the next page. */
+  async listBatches({ limit = 20, before, ...options } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new TypeError('limit must be an integer from 1 to 50');
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (before != null) params.set('before', checkId('batch', before));
+    const response = await this.#request(`watermarks/batches?${params}`, { method: 'GET', headers: this.#headers() },
+      { durable: true, ...callOptions(options) });
+    let page;
+    try { page = await response.json(); } catch { page = null; }
+    if (!page || !Array.isArray(page.data)) throw new EtchvError(response.status, 'Invalid batch list response', response.headers.get('x-request-id'));
+    return page;
   }
 
   // Assets

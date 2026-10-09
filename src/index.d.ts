@@ -1,7 +1,14 @@
+/// <reference types="node" />
 /** SDK version. Sent in the `User-Agent` header of every request. */
 export declare const VERSION: string;
 /** Default `largeFileThreshold`: 40 MB. */
 export declare const LARGE_FILE_THRESHOLD: number;
+/** Most files in one batch: 100. */
+export declare const MAX_BATCH_ITEMS: number;
+/** Average upload speed retries allow for (128 KiB/s): uploads retry for the client timeout plus size / this rate. A single upload only times out when no bytes move for the client timeout. */
+export declare const UPLOAD_MIN_BYTES_PER_SECOND: number;
+/** Largest batch archive the SDK downloads: 1 GiB + 64 MiB. Larger ones reject with `code` `archive_too_large`. */
+export declare const ARCHIVE_MAX_BYTES: number;
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 export type Media = 'images' | 'documents' | 'videos';
@@ -93,6 +100,19 @@ export declare class EtchvError extends Error {
 /** HTTP 5xx. */ export declare class ServiceUnavailableError extends EtchvError {}
 /** Client deadline exceeded (`statusCode` 0). `detail.idempotencyKey` is set for durable operations. */
 export declare class EtchvTimeoutError extends EtchvError {}
+/**
+ * `submitBatch` failed after the batch was created. Call `submitBatch` again with
+ * `idempotencyKey` and the same items to upload what is missing and start. `statusCode` is 0
+ * for a network error, timeout, unreadable file or abort (see `cause`). After an abort through
+ * `signal`, `code` is `batch_aborted` and `name` is the abort reason's name (usually `'AbortError'`).
+ */
+export declare class BatchSubmitError extends EtchvError {
+  batchId: string;
+  idempotencyKey: string;
+  /** The file that failed, when one did. */
+  index: number | null;
+  filename: string | null;
+}
 
 export interface Asset {
   id: string; name: string; kind: 'source' | 'watermarked'; media_type: MediaType;
@@ -120,7 +140,14 @@ export interface WebhookDelivery {
 export interface WebhookDeliveryPage { data: WebhookDelivery[]; next_cursor: string | null }
 export type WebhookEventType =
   | 'watermark.embed.succeeded' | 'watermark.embed.failed' | 'watermark.detect.succeeded' | 'watermark.detect.failed'
-  | 'storage.delivery.succeeded' | 'storage.delivery.failed';
+  | 'storage.delivery.succeeded' | 'storage.delivery.failed'
+  | 'watermark.batch.completed' | 'watermark.batch.failed' | 'watermark.batch.cancelled';
+/** `data` of a `watermark.batch.*` event, sent once when the batch ends. */
+export interface BatchEventData {
+  batch_id: string; status: 'completed' | 'failed' | 'cancelled'; item_count: number;
+  counts: Record<string, number>; credits: Record<string, number>; status_url: string;
+  archive_status?: string | null; archive_url?: string; archive_expires_at?: string | null;
+}
 export interface StorageDeliveryEventData {
   delivery_id: string; asset_id: string; request_id: string; destination_id: string;
   status: string; error_code: string | null; uri: string | null; public_url: string | null;
@@ -128,7 +155,7 @@ export interface StorageDeliveryEventData {
 /** Verified webhook event. Watermark events carry a job receipt plus `watermark_id`. */
 export interface WebhookEvent {
   id: string; type: WebhookEventType | (string & {}); api_version: string; created_at: string;
-  data: (Job & { watermark_id: string | null }) | StorageDeliveryEventData | Record<string, JsonValue>;
+  data: (Job & { watermark_id: string | null }) | StorageDeliveryEventData | BatchEventData | Record<string, JsonValue>;
 }
 export interface WebhookVerifyOptions {
   /** Maximum clock difference in seconds (default 300). */
@@ -165,6 +192,76 @@ export interface StorageDelivery {
   history: Record<string, JsonValue>[]; expires_at: string | null;
 }
 export interface StorageDeliveryPage { items: StorageDelivery[]; next_cursor: string | null }
+
+/** Batch lifecycle. `completed`, `failed`, `cancelled` and `expired` are final. */
+export type BatchStatus = 'draft' | 'starting' | 'processing' | 'assembling' | 'completed' | 'failed' | 'cancelled' | 'expired';
+/** One file's state inside a batch. */
+export type BatchItemStatus = 'pending' | 'rejected' | 'queued' | 'running' | 'retrying' | 'succeeded' | 'failed';
+/** One file for `submitBatch`. The filename's extension sets the media type. */
+export interface BatchItem {
+  filename: string;
+  /** The file's bytes, or a path to read it from. */
+  file: Uint8Array | string;
+  /** Forensic data to embed (non-empty, up to 8 KB as JSON). */
+  data: Record<string, JsonValue>;
+}
+/** One zip member for `submitBatchZip`: its exact path inside the zip and its data. */
+export interface ZipBatchItem { filename: string; data: Record<string, JsonValue> }
+export interface BatchOptions extends CallOptions {
+  /** Also zip every result into one download (`downloadBatchArchive`). Not with `storageDestinationId`. */
+  archive?: boolean;
+  /** Enabled webhook endpoint (`wh_…`) that receives one `watermark.batch.*` event when the batch ends. */
+  webhookId?: string;
+  /** `'gpu'` requests GPU processing for every file (see `RequestOptions.accelerator`). */
+  accelerator?: Accelerator;
+  /** Deliver every result to this verified storage destination (`dst_…`). */
+  storageDestinationId?: string;
+  /** 8–128 letters, digits, hyphens or underscores. Generated when omitted; reuse it to resume a batch. */
+  idempotencyKey?: string;
+  /** Files uploaded at once (1–16, default 4). */
+  uploadConcurrency?: number;
+}
+export interface WaitForBatchOptions {
+  /** Abort the wait. */
+  signal?: AbortSignal;
+  /** Whole wait in milliseconds (default one hour). */
+  timeout?: number;
+  /** Minimum milliseconds between polls; `Retry-After` from the API is always honored. */
+  pollInterval?: number;
+}
+/** One file of a batch as the API reports it. */
+export interface BatchEntry {
+  index: number; filename: string; size: number | null; upload_id: string | null; request_id: string | null;
+  status: BatchItemStatus;
+  /** Why a `rejected` or `failed` item has no result, e.g. `upload_not_received`, `invalid_input`, `insufficient_credits`, `cancelled`. */
+  error_code: string | null; error_detail: string | null;
+  /** Credits charged once accepted (0 when refunded). */
+  credits: number | null;
+  status_url?: string; result_url?: string; result_expires_at?: string | null;
+  /** Signed upload URL, only on pending items of a draft whose file has not arrived. Never send the API key to it. */
+  upload?: { method: 'PUT'; url: string; expires_at: string };
+  /** True on a replayed draft when this file already arrived. */
+  upload_received?: boolean;
+}
+export interface Batch {
+  batch_id: string; status: BatchStatus; item_count: number; archive: boolean; accelerator: Accelerator;
+  webhook_id: string | null; storage_destination_id: string | null;
+  counts: { pending: number; accepted: number; rejected: number; succeeded: number; failed: number; in_progress: number };
+  credits: { reserved: number; charged: number; refunded: number };
+  cancel_requested: boolean; created_at: string; started_at: string | null; completed_at: string | null;
+  upload_expires_at: string; status_url: string;
+  /** Set when the batch was created with `archive: true`. */
+  archive_status?: string | null; archive_url?: string; archive_expires_at?: string | null;
+  /** Every file; absent in `listBatches` pages. */
+  items?: BatchEntry[];
+}
+export interface BatchPage { data: Batch[]; next_cursor: string | null }
+/** One item from `iterBatchResults`: the verified file (`ok: true`), or why there is none. */
+export type BatchItemResult = { index: number; filename: string; status: BatchItemStatus; requestId: string | null } & (
+  | { ok: true; result: EmbedResult; errorCode: null; errorDetail: null }
+  /** `errorCode` explains the missing result; its credits were refunded or never charged. */
+  | { ok: false; result: null; errorCode: string; errorDetail: string | null }
+);
 
 export interface EtchvOptions {
   /** Organization API key, sent as `X-API-Key`. */
@@ -221,6 +318,34 @@ export declare class Etchv {
   getEmbedResult(requestId: string, options?: CallOptions): Promise<EmbedResult>;
   /** Wait for a detection job's result. Rejects with `GoneError` if expired. */
   getDetectionResult(requestId: string, options?: CallOptions): Promise<DetectionResult>;
+
+  /**
+   * Watermark up to 100 files as one batch: create, upload each file to its signed URL
+   * (without the API key), start. Resolves with the started batch. More than 100 items
+   * rejects with a `RangeError` before any request.
+   */
+  submitBatch(items: BatchItem[], options?: BatchOptions): Promise<Batch>;
+  /** Create and start a batch from one zip (up to 55 MB) whose members are all listed in `items`. */
+  submitBatchZip(zip: Uint8Array | string, items: ZipBatchItem[], options?: Omit<BatchOptions, 'uploadConcurrency'>): Promise<Batch>;
+  /** Read a batch with every item's status. */
+  getBatch(batchId: string, options?: CallOptions): Promise<Batch>;
+  /** Poll until the batch is final, honoring `Retry-After`. Rejects with `EtchvTimeoutError` after `timeout`. */
+  waitForBatch(batchId: string, options?: WaitForBatchOptions): Promise<Batch>;
+  /** Wait for the batch, then yield each item's verified file or error code, in order. */
+  iterBatchResults(batchId: string, options?: WaitForBatchOptions): AsyncIterable<BatchItemResult>;
+  /**
+   * Wait for and download the batch zip (`archive: true`). `timeout` bounds the wait; the
+   * download fails only when no data arrives for the client timeout. Rejects with
+   * `ConflictError` (`archive_not_requested`, `batch_not_started`, `archive_too_large`,
+   * `archive_unavailable`) or `GoneError`.
+   */
+  downloadBatchArchive(batchId: string, options?: Omit<WaitForBatchOptions, 'pollInterval'>): Promise<Uint8Array>;
+  /** Stream the batch zip to a file path (through a `.part` file) or a writable stream; resolves with the bytes written. */
+  downloadBatchArchiveTo(batchId: string, destination: string | NodeJS.WritableStream, options?: Omit<WaitForBatchOptions, 'pollInterval'>): Promise<number>;
+  /** Cancel a batch: files still waiting fail with error code `cancelled` and are refunded; queued and running files finish. */
+  cancelBatch(batchId: string, options?: CallOptions): Promise<Batch>;
+  /** List batches newest first (without items). */
+  listBatches(options?: CallOptions & { limit?: number; before?: string }): Promise<BatchPage>;
 
   listAssets(options?: ListAssetsOptions): Promise<AssetPage>;
   getAsset(id: string, options?: CallOptions & { includeMetadata?: boolean }): Promise<Asset>;
