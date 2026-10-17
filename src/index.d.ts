@@ -61,7 +61,9 @@ export interface Job {
 }
 export interface EmbedResult {
   /** Native watermarked file bytes (image, PDF or video). Write them without re-encoding. */
-  image: Uint8Array; watermarkId: string; requestId: string | null; contentType: string; filename: string;
+  image: Uint8Array;
+  /** Unique forensic watermark ID for this file, as 64 hexadecimal characters. */
+  watermarkId: string; requestId: string | null; contentType: string; filename: string;
   assetId: string | null; sourceAssetId: string | null; storageDeliveryId: string | null;
   /** Processor that actually ran, or `null` when the response did not say. */
   accelerator: Accelerator | null;
