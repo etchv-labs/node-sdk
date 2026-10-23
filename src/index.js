@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { open, readFile, rename, rm, stat } from 'node:fs/promises';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const MB = 1024 * 1024;
@@ -975,9 +975,9 @@ export class Etchv {
 
   /** Watermark an image and wait for the verified file in its original format. */
   async embedImage(image, data, options = {}) { return this.#embed('images', image, data, options); }
-  /** Watermark a PDF and wait for the verified file. */
+  /** Watermark a PDF, DOCX or PPTX and wait for the verified file. */
   async embedDocument(document, data, options = {}) { return this.#embed('documents', document, data, { filename: 'document.pdf', ...options }); }
-  /** Watermark an MP4/MOV video and wait for the verified file. */
+  /** Watermark an MP4, MOV, WebM, Matroska, MPEG or AVI video and wait for the verified file. */
   async embedVideo(video, data, options = {}) { return this.#embed('videos', video, data, { filename: 'video.mp4', ...options }); }
   async #embed(media, file, data, options) {
     const response = await this.#post(`watermarks/${media}`, file, options, encodeData(data));
@@ -1000,7 +1000,7 @@ export class Etchv {
 
   /** Detect a watermark in an image. Not retried automatically. */
   async detectImage(image, options = {}) { return this.#detect('images', image, options); }
-  /** Detect watermarks in each page of a PDF. Not retried automatically. */
+  /** Detect watermarks in a PDF (each page), DOCX or PPTX. Not retried automatically. */
   async detectDocument(document, options = {}) { return this.#detect('documents', document, { filename: 'document.pdf', ...options }); }
   /** Detect watermarks in a video; waits for the durable detection job. */
   async detectVideo(video, options = {}) { return this.#detect('videos', video, { filename: 'video.mp4', ...options }); }
@@ -1026,10 +1026,11 @@ export class Etchv {
     if (!Array.isArray(rawUnits) || !rawUnits.length || rawUnits.some((unit, index) =>
       !unit || unit.index !== index || typeof unit.watermarked !== 'boolean' ||
       typeof unit.confidence !== 'number' || !Number.isFinite(unit.confidence) || unit.confidence < 0 || unit.confidence > 1 ||
-      (unit.watermarked ? !validId(unit.watermark_id) : unit.watermark_id !== null))) {
+      (unit.watermarked ? !validId(unit.watermark_id) : unit.watermark_id !== null) ||
+      (unit.part != null && typeof unit.part !== 'string'))) {
       throw new EtchvError(200, 'Invalid detection units', requestId);
     }
-    const units = rawUnits.map(unit => ({ index: unit.index, watermarked: unit.watermarked, confidence: unit.confidence, watermarkId: unit.watermark_id }));
+    const units = rawUnits.map(unit => ({ index: unit.index, watermarked: unit.watermarked, confidence: unit.confidence, watermarkId: unit.watermark_id, part: unit.part ?? null }));
     const accelerator = acceleratorUsed(response.headers.get('x-etchv-accelerator')) ?? acceleratorUsed(result.accelerator);
     return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId, units, accelerator };
   }
@@ -1042,11 +1043,20 @@ const acceleratorUsed = value => {
 };
 const validId = value => typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
 
+const OFFICE_TYPES = {
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+};
 function fileExtension(bytes, mime) {
   const starts = (signature, offset = 0) => signature.every((byte, i) => bytes[offset + i] === byte);
   const ascii = (text, offset = 0) => starts(Array.from(text, c => c.charCodeAt(0)), offset);
   if ((mime === 'video/mp4' || mime === 'video/quicktime') && ascii('ftyp', 4)) return mime === 'video/mp4' ? 'mp4' : 'mov';
   if (mime === 'application/pdf' && ascii('%PDF-')) return 'pdf';
+  if (OFFICE_TYPES[mime] && ascii('PK\x03\x04')) return OFFICE_TYPES[mime];
+  if ((mime === 'video/webm' || mime === 'video/x-matroska') && starts([0x1a, 0x45, 0xdf, 0xa3])) return mime === 'video/webm' ? 'webm' : 'mkv';
+  if (mime === 'video/mpeg' && starts([0, 0, 1, 0xba])) return 'mpg';
+  if (mime === 'video/mp2t' && bytes.length > 376 && bytes[0] === 0x47 && bytes[188] === 0x47 && bytes[376] === 0x47) return 'ts';
+  if (mime === 'video/x-msvideo' && ascii('RIFF') && ascii('AVI ', 8)) return 'avi';
   if (mime === 'image/png' && starts([137, 80, 78, 71, 13, 10, 26, 10])) return 'png';
   if (mime === 'image/jpeg' && starts([255, 216, 255])) return 'jpg';
   if (mime === 'image/gif' && (ascii('GIF87a') || ascii('GIF89a'))) return 'gif';

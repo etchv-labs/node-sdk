@@ -68,7 +68,11 @@ export interface EmbedResult {
   /** Processor that actually ran, or `null` when the response did not say. */
   accelerator: Accelerator | null;
 }
-export interface DetectionUnit { index: number; watermarked: boolean; confidence: number; watermarkId: string | null }
+export interface DetectionUnit {
+  index: number; watermarked: boolean; confidence: number; watermarkId: string | null;
+  /** DOCX/PPTX only: the package part that carries this unit; otherwise null. Results from this SDK always set it; it is optional so unit literals written for 1.2.0 still type-check. */
+  part?: string | null;
+}
 export interface DetectionResult {
   units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null;
   /** Processor that actually ran, or `null` when the response did not say. */
@@ -299,13 +303,13 @@ export declare class Etchv {
 
   /** Watermark an image and wait for the verified file. Retries transient failures and polls with the same idempotency key. */
   embedImage(image: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
-  /** Watermark a PDF and wait for the verified file. */
+  /** Watermark a PDF, DOCX or PPTX and wait for the verified file. */
   embedDocument(document: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
-  /** Watermark an MP4/MOV video and wait for the verified file. */
+  /** Watermark an MP4, MOV, WebM, Matroska, MPEG or AVI video and wait for the verified file. */
   embedVideo(video: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
   /** Detect an image watermark (synchronous; not retried). */
   detectImage(image: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
-  /** Detect PDF watermarks page by page (synchronous; not retried). */
+  /** Detect watermarks in a PDF (page by page), DOCX or PPTX (synchronous; not retried). */
   detectDocument(document: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
   /** Detect video watermarks; waits for the durable detection job. */
   detectVideo(video: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
