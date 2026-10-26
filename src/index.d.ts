@@ -15,6 +15,11 @@ export type Media = 'images' | 'documents' | 'videos';
 export type MediaType = 'image' | 'document' | 'video';
 /** Processor for watermark embedding and detection. */
 export type Accelerator = 'cpu' | 'gpu';
+/**
+ * What PDF watermarking does with scripts and actions: `'keep'` (the default) returns them as
+ * uploaded; `'remove_auto_run'` removes what a viewer runs by itself. PDF only.
+ */
+export type ActiveContent = 'keep' | 'remove_auto_run';
 
 /** Options accepted by every API method. */
 export interface CallOptions {
@@ -44,6 +49,16 @@ export interface AsyncOptions extends RequestOptions {
   /** Enabled webhook endpoint (`wh_…`) that receives a signed terminal event. */
   webhookId?: string;
 }
+/** Options for document embedding (`embedDocument`, `submitEmbed('documents', ...)`). */
+export interface DocumentOptions extends RequestOptions {
+  /**
+   * PDF only: `'remove_auto_run'` also removes what a PDF viewer runs by itself (the open
+   * action, document and page actions, document-level JavaScript, XFA forms); the API refuses
+   * it for DOCX and PPTX. Omit or `'keep'` to keep them. Other media throw `TypeError` at run time.
+   */
+  activeContent?: ActiveContent;
+}
+export interface AsyncDocumentOptions extends AsyncOptions, DocumentOptions {}
 
 /** Result of `GET /auth/api-key`. */
 export interface ApiKeyInfo { organization_id: string; key_id: string; scopes: string[] }
@@ -222,6 +237,8 @@ export interface BatchOptions extends CallOptions {
   accelerator?: Accelerator;
   /** Deliver every result to this verified storage destination (`dst_…`). */
   storageDestinationId?: string;
+  /** `'remove_auto_run'` for every file, which must then all be PDFs (see `DocumentOptions.activeContent`). */
+  activeContent?: ActiveContent;
   /** 8–128 letters, digits, hyphens or underscores. Generated when omitted; reuse it to resume a batch. */
   idempotencyKey?: string;
   /** Files uploaded at once (1–16, default 4). */
@@ -252,6 +269,8 @@ export interface BatchEntry {
 export interface Batch {
   batch_id: string; status: BatchStatus; item_count: number; archive: boolean; accelerator: Accelerator;
   webhook_id: string | null; storage_destination_id: string | null;
+  /** What the batch's PDFs keep of their scripts and actions. */
+  active_content?: ActiveContent;
   counts: { pending: number; accepted: number; rejected: number; succeeded: number; failed: number; in_progress: number };
   credits: { reserved: number; charged: number; refunded: number };
   cancel_requested: boolean; created_at: string; started_at: string | null; completed_at: string | null;
@@ -303,8 +322,12 @@ export declare class Etchv {
 
   /** Watermark an image and wait for the verified file. Retries transient failures and polls with the same idempotency key. */
   embedImage(image: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
-  /** Watermark a PDF, DOCX or PPTX and wait for the verified file. */
-  embedDocument(document: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
+  /**
+   * Watermark a PDF, DOCX or PPTX and wait for the verified file. PDFs take 1 to 2,000 pages and
+   * up to 50 MB, and the watermarked copy must fit in 95 MB with 48 KB per page; DOCX and PPTX up
+   * to 20 MB. `activeContent` applies to PDFs.
+   */
+  embedDocument(document: Uint8Array, data: Record<string, JsonValue>, options?: DocumentOptions): Promise<EmbedResult>;
   /** Watermark an MP4, MOV, WebM, Matroska, MPEG or AVI video and wait for the verified file. */
   embedVideo(video: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
   /** Detect an image watermark (synchronous; not retried). */
@@ -315,6 +338,7 @@ export declare class Etchv {
   detectVideo(video: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
 
   /** Submit an async embedding job; resolves with the `202` receipt. */
+  submitEmbed(media: 'documents', file: Uint8Array, data: Record<string, JsonValue>, options?: AsyncDocumentOptions): Promise<Job>;
   submitEmbed(media: Media, file: Uint8Array, data: Record<string, JsonValue>, options?: AsyncOptions): Promise<Job>;
   /** Submit an async detection job; resolves with the `202` receipt. Storage options are not accepted. */
   submitDetection(media: Media, file: Uint8Array, options?: Omit<AsyncOptions, 'storageDestinationId' | 'storageKey'>): Promise<Job>;

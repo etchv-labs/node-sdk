@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { open, readFile, rename, rm, stat } from 'node:fs/promises';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const MB = 1024 * 1024;
@@ -30,6 +30,7 @@ const IDS = {
   batch: [/^bat_[a-f0-9]{32}$/, 'batch ID'],
 };
 const ACCELERATORS = ['cpu', 'gpu'];
+const ACTIVE_CONTENT = ['keep', 'remove_auto_run'];
 const SECRET_TEXT = /\b(?:etchv|whsec|sk_live|sk_test)_[A-Za-z0-9_+/=-]+/g;
 
 function errorMessage(statusCode, detail) {
@@ -214,14 +215,17 @@ async function batchFiles(items) {
   }));
 }
 
-function batchOptions({ archive, webhookId, accelerator, storageDestinationId }) {
+function checkChoice(name, value, choices) {
+  if (!choices.includes(value)) throw new TypeError(`${name} must be ${choices.map((choice) => `'${choice}'`).join(' or ')}`);
+  return value;
+}
+
+function batchOptions({ archive, webhookId, accelerator, storageDestinationId, activeContent }) {
   if (typeof archive !== 'boolean') throw new TypeError('archive must be a boolean');
   const options = { archive };
   if (webhookId != null) options.webhook_id = checkId('webhook', webhookId);
-  if (accelerator != null) {
-    if (!ACCELERATORS.includes(accelerator)) throw new TypeError("accelerator must be 'cpu' or 'gpu'");
-    options.accelerator = accelerator;
-  }
+  if (accelerator != null) options.accelerator = checkChoice('accelerator', accelerator, ACCELERATORS);
+  if (activeContent != null) options.active_content = checkChoice('activeContent', activeContent, ACTIVE_CONTENT);
   if (storageDestinationId != null) {
     if (archive) throw new TypeError('archive and storageDestinationId cannot be combined');
     options.storage_destination_id = checkId('destination', storageDestinationId);
@@ -271,7 +275,7 @@ export class Etchv {
     return { 'X-API-Key': this.#apiKey, 'User-Agent': this.#userAgent, ...extra };
   }
 
-  async #post(path, file, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey, accelerator, signal, timeout } = {}, data) {
+  async #post(path, file, { filename = 'image.png', idempotencyKey, storageDestinationId, storageKey, accelerator, activeContent, signal, timeout } = {}, data) {
     const detect = path.split('?')[0].includes('/detect');
     const limit = detect ? DETECT_MAX_BYTES : EMBED_MAX_BYTES;
     if (!(file instanceof Uint8Array) || !file.byteLength || file.byteLength > limit) {
@@ -290,8 +294,11 @@ export class Etchv {
       path += (path.includes('?') ? '&' : '?') + params;
     }
     if (accelerator != null) {
-      if (!ACCELERATORS.includes(accelerator)) throw new TypeError("accelerator must be 'cpu' or 'gpu'");
-      path += (path.includes('?') ? '&' : '?') + new URLSearchParams({ accelerator });
+      path += (path.includes('?') ? '&' : '?') + new URLSearchParams({ accelerator: checkChoice('accelerator', accelerator, ACCELERATORS) });
+    }
+    if (activeContent != null) {
+      if (detect || !path.startsWith('watermarks/documents')) throw new TypeError('activeContent applies to PDF documents only');
+      path += (path.includes('?') ? '&' : '?') + new URLSearchParams({ active_content: checkChoice('activeContent', activeContent, ACTIVE_CONTENT) });
     }
     const form = new FormData();
     if (file.byteLength > this.#largeFileThreshold) {
@@ -528,7 +535,7 @@ export class Etchv {
    * start. Resuming a batch that was not started within 24 hours rejects with `GoneError`
    * (`code` `batch_expired`).
    */
-  async submitBatch(items, { archive = false, webhookId, accelerator, storageDestinationId, idempotencyKey,
+  async submitBatch(items, { archive = false, webhookId, accelerator, storageDestinationId, activeContent, idempotencyKey,
     uploadConcurrency = 4, signal, timeout } = {}) {
     const files = await batchFiles(items);
     if (!Number.isSafeInteger(uploadConcurrency) || uploadConcurrency < 1 || uploadConcurrency > 16) {
@@ -536,7 +543,7 @@ export class Etchv {
     }
     const key = batchKey(idempotencyKey);
     const body = { items: files.map(({ filename, size, data }) => ({ filename, size, data })),
-      ...batchOptions({ archive, webhookId, accelerator, storageDestinationId }) };
+      ...batchOptions({ archive, webhookId, accelerator, storageDestinationId, activeContent }) };
     // 503 means batch uploads are unavailable: reject at once (submitBatchZip still works).
     const { batch } = await this.#batchRequest('watermarks/batches', {
       method: 'POST', body: encodeJson(body), key, retry: [429, 502, 504], signal, timeout });
@@ -593,7 +600,7 @@ export class Etchv {
    * Create and start a batch from one zip (up to 55 MB) of files already together. `items`
    * lists every member as `{ filename: <exact member path>, data }`. Retried like `submitBatch`.
    */
-  async submitBatchZip(zip, items, { archive = false, webhookId, accelerator, storageDestinationId, idempotencyKey, signal, timeout } = {}) {
+  async submitBatchZip(zip, items, { archive = false, webhookId, accelerator, storageDestinationId, activeContent, idempotencyKey, signal, timeout } = {}) {
     const bytes = typeof zip === 'string' ? await readFile(zip) : zip;
     if (!(bytes instanceof Uint8Array) || bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes.byteLength > ZIP_BATCH_MAX_BYTES) {
       throw new TypeError(`zip must be a zip of up to ${ZIP_BATCH_MAX_BYTES / MB} MB (bytes or a file path)`);
@@ -605,7 +612,7 @@ export class Etchv {
     });
     const form = new FormData();
     form.append('archive', new Blob([bytes], { type: 'application/zip' }), 'batch.zip');
-    form.append('manifest', encodeJson({ items: members, ...batchOptions({ archive, webhookId, accelerator, storageDestinationId }) }));
+    form.append('manifest', encodeJson({ items: members, ...batchOptions({ archive, webhookId, accelerator, storageDestinationId, activeContent }) }));
     return (await this.#batchRequest('watermarks/batches/zip', {
       method: 'POST', form, key: batchKey(idempotencyKey), accepted: true, signal, timeout })).batch;
   }
@@ -975,7 +982,10 @@ export class Etchv {
 
   /** Watermark an image and wait for the verified file in its original format. */
   async embedImage(image, data, options = {}) { return this.#embed('images', image, data, options); }
-  /** Watermark a PDF, DOCX or PPTX and wait for the verified file. */
+  /**
+   * Watermark a PDF, DOCX or PPTX and wait for the verified file. `activeContent: 'remove_auto_run'`
+   * removes what a PDF viewer runs by itself; `'keep'`, the default, returns scripts and actions as uploaded.
+   */
   async embedDocument(document, data, options = {}) { return this.#embed('documents', document, data, { filename: 'document.pdf', ...options }); }
   /** Watermark an MP4, MOV, WebM, Matroska, MPEG or AVI video and wait for the verified file. */
   async embedVideo(video, data, options = {}) { return this.#embed('videos', video, data, { filename: 'video.mp4', ...options }); }

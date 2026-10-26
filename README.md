@@ -35,10 +35,12 @@ console.log(detection.watermarked, detection.watermarkId, detection.confidence);
 Use `embedDocument` / `detectDocument` for PDF, DOCX and PPTX and `embedVideo` /
 `detectVideo` for MP4, MOV, WebM, Matroska, MPEG and AVI
 ([supported codecs](https://etchv.com/docs/api/videos#supported-files)). Image
-uploads are limited to 50 MB; document and video uploads to 20 MB.
-Detection takes the files Etchv delivered: up to 192 MB for images, 64 MB for
-PDFs and 100 MB for DOCX, PPTX and video. Detection recovers a SHA-256 digest of your data, not
-the data itself. Every method accepts `signal` and `timeout`.
+and PDF uploads are limited to 50 MB; DOCX, PPTX and video uploads to 20 MB. A
+PDF has 1 to 2,000 pages, and its watermarked copy must fit in 95 MB with 48 KB
+per page, so a 2,000-page PDF can be up to about 1 MB. Detection takes the files
+Etchv delivered: up to 192 MB for images, 95 MB for PDFs and 100 MB for DOCX,
+PPTX and video. Detection recovers a SHA-256 digest of your data, not the data
+itself. Every method accepts `signal` and `timeout`.
 
 ## Large files
 
@@ -52,6 +54,23 @@ explicitly:
 ```js
 const upload = await client.uploadFile('detect', delivered, { filename: 'delivered.tiff' });
 upload.upload_id; // send as the upload_id form field instead of file
+```
+
+## PDF scripts and actions
+
+A watermarked PDF keeps its scripts, actions, form fields and attachments
+exactly as uploaded. Pass `activeContent: 'remove_auto_run'` to `embedDocument`,
+`submitEmbed('documents', ...)`, `submitBatch` or `submitBatchZip` to also
+remove what a PDF viewer runs by itself: the open action, document and page
+actions, document-level JavaScript and XFA forms. Links, form fields and
+attachments stay. `'remove_auto_run'` is for PDFs only: the API refuses it for a
+DOCX or PPTX, and for a batch unless every file is a PDF. Keeping active content
+is accepted for any document and any batch.
+[Scripts and actions](https://etchv.com/docs/api/documents#scripts-and-actions).
+
+```js
+const result = await client.embedDocument(await readFile('contract.pdf'), { recipient: 'counsel-7' },
+  { filename: 'contract.pdf', activeContent: 'remove_auto_run' });
 ```
 
 ## GPU processing
@@ -118,8 +137,8 @@ to a path or writable stream; `downloadBatchArchive` returns a `Uint8Array`.
 More than 100 items reject with a `RangeError` before any request; split larger
 sets into several batches. Pass `webhookId` to get one
 `watermark.batch.completed`, `watermark.batch.failed` or
-`watermark.batch.cancelled` event when the batch ends, and `accelerator` or
-`storageDestinationId` as for single files. Retries reuse the same
+`watermark.batch.cancelled` event when the batch ends, and `accelerator`,
+`storageDestinationId` or `activeContent` as for single files. Retries reuse the same
 `idempotencyKey` (generated when omitted). If an upload or the start still
 fails, `BatchSubmitError` carries `batchId` and `idempotencyKey`; calling
 `submitBatch` again with that key and the same items uploads only the files that
