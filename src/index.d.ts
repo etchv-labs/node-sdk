@@ -83,6 +83,8 @@ export interface EmbedResult {
   /** Processor that actually ran, or `null` when the response did not say. */
   accelerator: Accelerator | null;
 }
+export interface DetectedCopy { asset_id: string; link: { id: string; name: string }; recipient: string; opened_at: string | null }
+export interface DetectedAsset { asset_id: string; name: string; metadata: Record<string, JsonValue>; created_at: string }
 export interface DetectionUnit {
   index: number; watermarked: boolean; confidence: number; watermarkId: string | null;
   /** DOCX/PPTX only: the package part that carries this unit; otherwise null. Results from this SDK always set it; it is optional so unit literals written for 1.2.0 still type-check. */
@@ -92,6 +94,10 @@ export interface DetectionResult {
   units: DetectionUnit[]; watermarked: boolean; confidence: number; watermarkId: string | null; requestId: string | null;
   /** Processor that actually ran, or `null` when the response did not say. */
   accelerator: Accelerator | null;
+  /** The traceable link copy the watermark is on, when the key has `links:read`; otherwise `null`. Optional so literals written for 1.4.0 still type-check. */
+  copy?: DetectedCopy | null;
+  /** Another of your watermarked assets the watermark is on, when the key has `assets:read`; otherwise `null`. */
+  asset?: DetectedAsset | null;
 }
 
 /** HTTP or protocol failure. `statusCode` is 0 for a client deadline. */
@@ -150,6 +156,59 @@ export interface ListAssetsOptions extends CallOptions {
 }
 export interface AssetUpdate { version: number; name?: string; metadata?: Record<string, JsonValue> | null }
 
+/** When a link makes its copies: as each recipient first opens it, or all at once when it is created. */
+export type LinkPrepare = 'on_open' | 'on_create';
+export interface LinkCreate {
+  /** A source asset (`kind` `source`). */
+  assetId: string;
+  /** 1–200 characters, shown to recipients. */
+  name: string;
+  /** Recipients' emails, up to 100. Give this or `allowedDomains`. */
+  recipients?: string[];
+  /** Email domains whose addresses may open the link (exact match), up to 10. */
+  allowedDomains?: string[];
+  /** Default 30 days from now, or the source file's expiry if sooner; at least five minutes away and at most a year. */
+  expiresAt?: Date | string;
+  prepare?: LinkPrepare;
+  /** Downloads allowed per recipient, 1–100. */
+  downloadLimit?: number;
+  /** Receives `link.opened` and `link.locked` events. */
+  webhookId?: string;
+}
+export interface LinkCopy { status: 'not_started' | 'preparing' | 'ready' | 'failed'; asset_id: string | null; error_code: string | null }
+export interface LinkRecipient {
+  email: string; status: 'not_opened' | 'opened'; opened_at: string | null; last_opened_at: string | null;
+  open_count: number; download_count: number; copy: LinkCopy;
+}
+export interface LinkSummary {
+  id: string;
+  /** Send this to your recipients. */
+  url: string;
+  name: string; asset_id: string; media_type: MediaType;
+  /** `unavailable`: the source file was deleted or expired, so no new copies are made. */
+  status: 'active' | 'revoked' | 'expired' | 'unavailable';
+  prepare: LinkPrepare; allowed_domains: string[]; expires_at: string; download_limit: number | null;
+  recipient_count: number; credits_per_copy: number; estimated_credits: number | null; batch_id: string | null;
+  webhook_id: string | null; created_at: string; revoked_at: string | null;
+}
+export interface Link extends LinkSummary { recipients: LinkRecipient[] }
+export interface LinkPage { data: LinkSummary[]; next_cursor: string | null }
+export interface LinkEstimate {
+  asset_id: string; media_type: MediaType; prepare: LinkPrepare; credits_per_copy: number;
+  estimated_credits: number | null; available_credits: number; enough_credits: boolean; latest_expires_at: string;
+}
+export interface LinkEvent {
+  id: string; type: 'opened' | 'downloaded' | 'locked'; recipient: string | null; created_at: string;
+  verified_by: string | null; asset_id: string | null;
+}
+export interface LinkEventPage { data: LinkEvent[]; next_cursor: string | null }
+/** `data` of a `link.opened` or `link.locked` event. */
+export interface LinkEventData {
+  link_id: string; name: string; asset_id: string;
+  recipient?: string; opened_at?: string; first_open?: boolean; verified_by?: string | null;
+  locked_until?: string; reason?: 'too_many_wrong_codes';
+}
+
 export interface WebhookEndpoint { id: string; url: string; enabled: boolean; created_at: string }
 /** Returned once on creation. Store `signing_secret` securely; it cannot be retrieved again. */
 export interface CreatedWebhookEndpoint extends WebhookEndpoint { signing_secret: string }
@@ -162,7 +221,8 @@ export interface WebhookDeliveryPage { data: WebhookDelivery[]; next_cursor: str
 export type WebhookEventType =
   | 'watermark.embed.succeeded' | 'watermark.embed.failed' | 'watermark.detect.succeeded' | 'watermark.detect.failed'
   | 'storage.delivery.succeeded' | 'storage.delivery.failed'
-  | 'watermark.batch.completed' | 'watermark.batch.failed' | 'watermark.batch.cancelled';
+  | 'watermark.batch.completed' | 'watermark.batch.failed' | 'watermark.batch.cancelled'
+  | 'link.opened' | 'link.locked';
 /** `data` of a `watermark.batch.*` event, sent once when the batch ends. */
 export interface BatchEventData {
   batch_id: string; status: 'completed' | 'failed' | 'cancelled'; item_count: number;
@@ -176,7 +236,7 @@ export interface StorageDeliveryEventData {
 /** Verified webhook event. Watermark events carry a job receipt plus `watermark_id`. */
 export interface WebhookEvent {
   id: string; type: WebhookEventType | (string & {}); api_version: string; created_at: string;
-  data: (Job & { watermark_id: string | null }) | StorageDeliveryEventData | BatchEventData | Record<string, JsonValue>;
+  data: (Job & { watermark_id: string | null }) | StorageDeliveryEventData | BatchEventData | LinkEventData | Record<string, JsonValue>;
 }
 export interface WebhookVerifyOptions {
   /** Maximum clock difference in seconds (default 300). */
@@ -376,6 +436,22 @@ export declare class Etchv {
   cancelBatch(batchId: string, options?: CallOptions): Promise<Batch>;
   /** List batches newest first (without items). */
   listBatches(options?: CallOptions & { limit?: number; before?: string }): Promise<BatchPage>;
+
+  /**
+   * Share a source asset so each recipient downloads their own watermarked copy. Send the returned
+   * `url` yourself. Rejects with `PaymentRequiredError` (`code` `insufficient_credits`) when the
+   * workspace lacks the credits for the copies. Retries reuse one `idempotencyKey`.
+   */
+  createLink(link: LinkCreate, options?: CallOptions & { idempotencyKey?: string }): Promise<Link>;
+  /** Every check of `createLink` without creating anything, with the credits its copies would take. */
+  estimateLink(link: LinkCreate, options?: CallOptions): Promise<LinkEstimate>;
+  /** List links newest first, without recipients. */
+  listLinks(options?: CallOptions & { limit?: number; before?: string }): Promise<LinkPage>;
+  getLink(id: string, options?: CallOptions): Promise<Link>;
+  /** A link's opens, downloads and locks, newest first. */
+  listLinkEvents(id: string, options?: CallOptions & { limit?: number; before?: string }): Promise<LinkEventPage>;
+  /** Stop new opens and downloads at once. Calling again returns the link. */
+  revokeLink(id: string, options?: CallOptions): Promise<Link>;
 
   listAssets(options?: ListAssetsOptions): Promise<AssetPage>;
   getAsset(id: string, options?: CallOptions & { includeMetadata?: boolean }): Promise<Asset>;

@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { open, readFile, rename, rm, stat } from 'node:fs/promises';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.4.0';
+export const VERSION = '1.5.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const MB = 1024 * 1024;
@@ -27,10 +27,12 @@ const IDS = {
   request: [/^req_[a-f0-9]{64}$/, 'request ID'], asset: [/^ast_[a-f0-9]{64}$/, 'asset ID'],
   webhook: [/^wh_[a-f0-9]{32}$/, 'webhook ID'], event: [/^evt_[a-f0-9]{64}$/, 'webhook event ID'],
   destination: [/^dst_[a-f0-9]{32}$/, 'storage destination ID'], delivery: [/^std_[a-f0-9]{64}$/, 'storage delivery ID'],
-  batch: [/^bat_[a-f0-9]{32}$/, 'batch ID'],
+  batch: [/^bat_[a-f0-9]{32}$/, 'batch ID'], link: [/^lnk_[a-f0-9]{32}$/, 'link ID'],
+  linkEvent: [/^lev_[a-f0-9]{32}$/, 'link event cursor'],
 };
 const ACCELERATORS = ['cpu', 'gpu'];
 const ACTIVE_CONTENT = ['keep', 'remove_auto_run'];
+const LINK_PREPARE = ['on_open', 'on_create'];
 const SECRET_TEXT = /\b(?:etchv|whsec|sk_live|sk_test)_[A-Za-z0-9_+/=-]+/g;
 
 function errorMessage(statusCode, detail) {
@@ -180,6 +182,37 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
   const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, Math.max(0, ms));
   signal?.addEventListener('abort', onAbort, { once: true });
 });
+
+function linkBody({ assetId, name, recipients, allowedDomains, expiresAt, prepare, downloadLimit, webhookId } = {}) {
+  checkId('asset', assetId);
+  if (typeof name !== 'string' || !name.trim() || [...name].length > 200) throw new TypeError('name must be 1–200 characters');
+  if ((recipients == null) === (allowedDomains == null)) throw new TypeError('Give either recipients or allowedDomains');
+  const audience = recipients ?? allowedDomains;
+  if (!Array.isArray(audience) || !audience.length || audience.some(value => typeof value !== 'string')) {
+    throw new TypeError('recipients or allowedDomains must be a non-empty array of strings');
+  }
+  const body = { asset_id: assetId, name, [recipients != null ? 'recipients' : 'allowed_domains']: [...audience] };
+  if (expiresAt !== undefined) {
+    if (expiresAt instanceof Date) {
+      if (Number.isNaN(expiresAt.getTime())) throw new TypeError('expiresAt must be a valid Date');
+      body.expires_at = expiresAt.toISOString();
+    } else if (typeof expiresAt === 'string') body.expires_at = expiresAt;
+    else throw new TypeError('expiresAt must be a Date or an ISO 8601 string');
+  }
+  if (prepare !== undefined) body.prepare = checkChoice('prepare', prepare, LINK_PREPARE);
+  if (downloadLimit !== undefined) {
+    if (!Number.isSafeInteger(downloadLimit) || downloadLimit < 1 || downloadLimit > 100) throw new TypeError('downloadLimit must be an integer from 1 to 100');
+    body.download_limit = downloadLimit;
+  }
+  if (webhookId !== undefined) body.webhook_id = checkId('webhook', webhookId);
+  return body;
+}
+
+async function responseJson(response) {
+  try { return await response.json(); } catch {
+    throw new EtchvError(response.status, 'Invalid JSON response', response.headers.get('x-request-id'));
+  }
+}
 
 function batchKey(key) {
   if (key === undefined) return globalThis.crypto.randomUUID();
@@ -395,10 +428,7 @@ export class Etchv {
 
   async #json(path, options) {
     const response = await this.#call(path, options);
-    if (response.status === 204) return undefined;
-    try { return await response.json(); } catch {
-      throw new EtchvError(response.status, 'Invalid JSON response', response.headers.get('x-request-id'));
-    }
+    return response.status === 204 ? undefined : responseJson(response);
   }
 
   async #bytes(path, options) {
@@ -859,6 +889,48 @@ export class Etchv {
     return page;
   }
 
+  // Traceable links
+
+  /**
+   * Share a source asset so each recipient downloads their own watermarked copy. Give `recipients`
+   * or `allowedDomains`; send the returned `url` yourself. Retries reuse one `idempotencyKey`
+   * (generated when omitted), so a retry returns the same link.
+   */
+  async createLink(link, { idempotencyKey, ...options } = {}) {
+    const body = linkBody(link);
+    const key = batchKey(idempotencyKey);
+    const headers = this.#headers({ 'Content-Type': 'application/json', 'Idempotency-Key': key });
+    return responseJson(await this.#request('links', { method: 'POST', headers, body: encodeJson(body) },
+      { durable: true, idempotencyKey: key, ...callOptions(options) }));
+  }
+  /** Run every check of `createLink` without creating anything; reports the credits its copies would take. */
+  async estimateLink(link, options = {}) {
+    return this.#json('links/estimate', { method: 'POST', body: linkBody(link), ...callOptions(options) });
+  }
+  /** List links newest first, without recipients. Pass `before: page.next_cursor` for the next page. */
+  async listLinks({ limit = 20, before, ...options } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new TypeError('limit must be an integer from 1 to 50');
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (before != null) params.set('before', checkId('link', before));
+    return this.#json(`links?${params}`, callOptions(options));
+  }
+  /** Read a link with each recipient, their opens and downloads, and their copy. */
+  async getLink(id, options = {}) {
+    return this.#json(`links/${checkId('link', id)}`, callOptions(options));
+  }
+  /** List a link's opens, downloads and locks newest first. Pass `before: page.next_cursor` for the next page. */
+  async listLinkEvents(id, { limit = 50, before, ...options } = {}) {
+    checkId('link', id);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new TypeError('limit must be an integer from 1 to 100');
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (before != null) params.set('before', checkId('linkEvent', before));
+    return this.#json(`links/${id}/events?${params}`, callOptions(options));
+  }
+  /** Stop new opens and downloads at once. Copies not yet queued are canceled; calling again returns the link. */
+  async revokeLink(id, options = {}) {
+    return this.#json(`links/${checkId('link', id)}/revoke`, { method: 'POST', ...callOptions(options) });
+  }
+
   // Assets
 
   /** List assets, newest first. Pass `cursor: page.next_cursor` with the same filters for the next page. */
@@ -1042,7 +1114,8 @@ export class Etchv {
     }
     const units = rawUnits.map(unit => ({ index: unit.index, watermarked: unit.watermarked, confidence: unit.confidence, watermarkId: unit.watermark_id, part: unit.part ?? null }));
     const accelerator = acceleratorUsed(response.headers.get('x-etchv-accelerator')) ?? acceleratorUsed(result.accelerator);
-    return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId, units, accelerator };
+    return { watermarked: result.watermarked, confidence: result.confidence, watermarkId: result.watermark_id, requestId, units, accelerator,
+      copy: record(result.copy), asset: record(result.asset) };
   }
 }
 
@@ -1051,6 +1124,8 @@ const acceleratorUsed = value => {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
   return ACCELERATORS.includes(normalized) ? normalized : null;
 };
+// A detection's copy or asset record, or null when absent.
+const record = value => (value && typeof value === 'object' && !Array.isArray(value) ? value : null);
 const validId = value => typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
 
 const OFFICE_TYPES = {

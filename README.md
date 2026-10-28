@@ -156,6 +156,32 @@ Also: `getBatch`, `cancelBatch` (files still waiting are canceled and
 refunded; queued and running files finish) and
 `listBatches({ limit, before })`.
 
+## Traceable links
+
+Share one file so each recipient downloads their own watermarked copy. Use the
+source asset of a file you've watermarked; send the returned `url` yourself.
+
+```ts
+const link = await client.createLink({
+  assetId: result.sourceAssetId!,
+  name: 'Board pack, October',
+  recipients: ['alex@example.com', 'sam@example.com'],
+  downloadLimit: 3,
+});
+console.log(link.url);
+```
+
+Give `allowedDomains: ['example.com']` instead of `recipients` to let anyone at
+those domains open it. `estimateLink` takes the same input and reports the
+credits the copies would take without creating anything. Also `getLink` (each
+recipient, their opens and their copy), `listLinks`, `listLinkEvents` and
+`revokeLink`.
+
+When a detected file is one of your links' copies, the detection result's
+`copy` names the link, the recipient and when they first opened it (needs
+`links:read`); `asset` names any other watermarked asset of yours (needs
+`assets:read`). See https://etchv.com/docs/api/links.
+
 ## Also included
 
 - API key check: `getApiKeyInfo()` (no credits used).

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.0
+
+- Traceable links: `createLink` shares a source asset so each recipient
+  downloads their own watermarked copy, with `recipients` or `allowedDomains`,
+  `expiresAt`, `prepare`, `downloadLimit` and `webhookId`. Retries reuse one
+  `Idempotency-Key`. Also `estimateLink`, `listLinks`, `getLink`,
+  `listLinkEvents` and `revokeLink`, with `Link`, `LinkCreate`, `LinkEstimate`,
+  `LinkEvent` and related types.
+- Detection results have `copy` (the traceable link copy a watermark is on:
+  link, recipient, first open) and `asset` (another watermarked asset of
+  yours), when your key may read them; both are `null` otherwise.
+- `WebhookEventType` includes `link.opened` and `link.locked`, with
+  `LinkEventData`.
+
 ## 1.4.0
 
 - `embedDocument`, `submitEmbed('documents', ...)`, `submitBatch` and
