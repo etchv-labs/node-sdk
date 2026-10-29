@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { open, readFile, rename, rm, stat } from 'node:fs/promises';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.5.0';
+export const VERSION = '1.6.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const MB = 1024 * 1024;
@@ -28,7 +28,7 @@ const IDS = {
   webhook: [/^wh_[a-f0-9]{32}$/, 'webhook ID'], event: [/^evt_[a-f0-9]{64}$/, 'webhook event ID'],
   destination: [/^dst_[a-f0-9]{32}$/, 'storage destination ID'], delivery: [/^std_[a-f0-9]{64}$/, 'storage delivery ID'],
   batch: [/^bat_[a-f0-9]{32}$/, 'batch ID'], link: [/^lnk_[a-f0-9]{32}$/, 'link ID'],
-  linkEvent: [/^lev_[a-f0-9]{32}$/, 'link event cursor'],
+  linkEvent: [/^lev_[a-f0-9]{32}$/, 'link event cursor'], linkRecipient: [/^lrc_[a-f0-9]{32}$/, 'recipient ID'],
 };
 const ACCELERATORS = ['cpu', 'gpu'];
 const ACTIVE_CONTENT = ['keep', 'remove_auto_run'];
@@ -929,6 +929,21 @@ export class Etchv {
   /** Stop new opens and downloads at once. Copies not yet queued are canceled; calling again returns the link. */
   async revokeLink(id, options = {}) {
     return this.#json(`links/${checkId('link', id)}/revoke`, { method: 'POST', ...callOptions(options) });
+  }
+  /**
+   * Delete a link with every recipient's opens, downloads and copy. It stops at once, as on a revoke. This can't be
+   * undone, and detection no longer names the link's recipients. Calling again resolves too.
+   */
+  async deleteLink(id, options = {}) {
+    await this.#call(`links/${checkId('link', id)}`, { method: 'DELETE', ...callOptions(options) });
+  }
+  /**
+   * Delete one recipient's opens, downloads and copy, and return the link without them. This can't be undone, and
+   * detection no longer names the recipient. `recipientId` is the recipient's `id` from `getLink`.
+   */
+  async removeLinkRecipient(id, recipientId, options = {}) {
+    checkId('link', id);
+    return this.#json(`links/${id}/recipients/${checkId('linkRecipient', recipientId)}`, { method: 'DELETE', ...callOptions(options) });
   }
 
   // Assets

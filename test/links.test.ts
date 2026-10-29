@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Etchv, PaymentRequiredError } from '../src/index.js';
+import { Etchv, NotFoundError, PaymentRequiredError, PermissionDeniedError } from '../src/index.js';
 
 const asset = 'ast_' + 'e'.repeat(64);
 const link = 'lnk_' + 'a'.repeat(32);
 const event = 'lev_' + 'b'.repeat(32);
 const hook = 'wh_' + 'c'.repeat(32);
+const recipient = 'lrc_' + 'd'.repeat(32);
 const view = { id: link, url: 'https://etchv.com/l/Yp3kQ8vN2rT6wX1zA4bC7d', name: 'Board pack', status: 'active', recipients: [] };
 
 type Call = { url: URL; init: RequestInit & { headers: Record<string, string> } };
@@ -87,6 +88,31 @@ test('estimate, list, read, events and revoke map to the documented routes', asy
   assert.equal((await sdk.getLink(link)).status, 'active');
   assert.equal((await sdk.listLinkEvents(link, { before: event })).data[0].type, 'opened');
   assert.equal((await sdk.revokeLink(link)).status, 'revoked');
+});
+
+test('deleteLink and removeLinkRecipient map to the documented routes', async () => {
+  const calls: Call[] = [];
+  const sdk = client(({ url, init }) => {
+    const route = `${init.method} ${url.pathname}`;
+    switch (route) {
+      case `DELETE /links/${link}`: return new Response(null, { status: 204 });
+      case `DELETE /links/${link}/recipients/${recipient}`: return Response.json({ ...view, recipients: [] });
+      default: throw new Error('unexpected ' + route);
+    }
+  }, calls);
+  assert.equal(await sdk.deleteLink(link), undefined);
+  assert.deepEqual((await sdk.removeLinkRecipient(link, recipient)).recipients, []);
+  assert.equal(calls.length, 2);
+});
+
+test('deletes surface refusals and check IDs before any request', async () => {
+  await assert.rejects(client(() => Response.json({ detail: 'Recipient not found' }, { status: 404 })).removeLinkRecipient(link, recipient), NotFoundError);
+  await assert.rejects(client(() => Response.json({ detail: 'needs assets:delete' }, { status: 403 })).deleteLink(link), PermissionDeniedError);
+  const sdk = client(() => { throw new Error('no request expected'); });
+  await assert.rejects(sdk.deleteLink('lnk_1'), TypeError);
+  await assert.rejects(sdk.removeLinkRecipient(link, 'lrc_1'), TypeError);
+  await assert.rejects(sdk.removeLinkRecipient('lnk_1', recipient), TypeError);
+  await assert.rejects(sdk.removeLinkRecipient(link, link), TypeError);
 });
 
 test('detection names the copy or asset when the response has them', async () => {

@@ -177,6 +177,8 @@ export interface LinkCreate {
 }
 export interface LinkCopy { status: 'not_started' | 'preparing' | 'ready' | 'failed'; asset_id: string | null; error_code: string | null }
 export interface LinkRecipient {
+  /** `lrc_…`: pass to `removeLinkRecipient`. */
+  id: string;
   email: string; status: 'not_opened' | 'opened'; opened_at: string | null; last_opened_at: string | null;
   open_count: number; download_count: number; copy: LinkCopy;
 }
@@ -452,6 +454,16 @@ export declare class Etchv {
   listLinkEvents(id: string, options?: CallOptions & { limit?: number; before?: string }): Promise<LinkEventPage>;
   /** Stop new opens and downloads at once. Calling again returns the link. */
   revokeLink(id: string, options?: CallOptions): Promise<Link>;
+  /**
+   * Delete a link with every recipient's opens, downloads and copy. Can't be undone; detection no longer names its
+   * recipients. Needs an owner or admin and, for an API key, `assets:delete` as well as `links:write`. Calling again resolves too.
+   */
+  deleteLink(id: string, options?: CallOptions): Promise<void>;
+  /**
+   * Delete one recipient's opens, downloads and copy; resolves to the link without them. Can't be undone; detection
+   * no longer names the recipient. Needs an owner or admin and, for an API key, `assets:delete` as well as `links:write`.
+   */
+  removeLinkRecipient(id: string, recipientId: string, options?: CallOptions): Promise<Link>;
 
   listAssets(options?: ListAssetsOptions): Promise<AssetPage>;
   getAsset(id: string, options?: CallOptions & { includeMetadata?: boolean }): Promise<Asset>;

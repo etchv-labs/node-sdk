@@ -177,6 +177,12 @@ credits the copies would take without creating anything. Also `getLink` (each
 recipient, their opens and their copy), `listLinks`, `listLinkEvents` and
 `revokeLink`.
 
+`deleteLink(id)` deletes a link with every recipient's opens, downloads and
+copy; `removeLinkRecipient(id, recipientId)` does the same for one recipient
+(their `id` in `getLink`) and resolves to the link without them. Neither can be
+undone, and detection no longer names a deleted recipient. Both need an owner or
+admin and, for an API key, `assets:delete` as well as `links:write`.
+
 When a detected file is one of your links' copies, the detection result's
 `copy` names the link, the recipient and when they first opened it (needs
 `links:read`); `asset` names any other watermarked asset of yours (needs
