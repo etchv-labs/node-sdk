@@ -3,7 +3,7 @@ import { once } from 'node:events';
 import { open, readFile, rename, rm, stat } from 'node:fs/promises';
 
 /** SDK version. Sent in the `User-Agent` header of every request. */
-export const VERSION = '1.6.0';
+export const VERSION = '1.7.0';
 
 const MEDIA = ['images', 'documents', 'videos'];
 const MB = 1024 * 1024;
@@ -23,6 +23,8 @@ const FINAL_BATCH = ['completed', 'failed', 'cancelled', 'expired'];
 const UPLOAD_KINDS = { images: 'image', documents: 'document', videos: 'video' };
 const FILENAMES = { images: 'image.png', documents: 'document.pdf', videos: 'video.mp4' };
 const DURABLE = ['watermarks/images', 'watermarks/documents', 'watermarks/videos', 'watermarks/videos/detect'];
+// Detections answered in the request: the API replays them for the same Idempotency-Key.
+const REPLAYABLE = ['watermarks/images/detect', 'watermarks/documents/detect'];
 const IDS = {
   request: [/^req_[a-f0-9]{64}$/, 'request ID'], asset: [/^ast_[a-f0-9]{64}$/, 'asset ID'],
   webhook: [/^wh_[a-f0-9]{32}$/, 'webhook ID'], event: [/^evt_[a-f0-9]{64}$/, 'webhook event ID'],
@@ -51,7 +53,9 @@ function errorMessage(statusCode, detail) {
  * statuses; all of them carry the HTTP `statusCode`, parsed `detail` and the
  * `X-Request-ID` (`requestId`) to quote when contacting support. `code` is the
  * API's machine-readable error code (such as `rate_limited`) when it sends one,
- * and `retryAfter` the `Retry-After` delay in seconds.
+ * and `retryAfter` the `Retry-After` delay in seconds. `idempotencyKey` is the key a
+ * keyed call (embedding, a job or a detection) was sent with, generated or yours:
+ * resend with it to get the same result without a second charge; otherwise `null`.
  */
 export class EtchvError extends Error {
   constructor(statusCode, detail, requestId = null, retryAfter = null) {
@@ -63,6 +67,7 @@ export class EtchvError extends Error {
     this.code = typeof detail?.detail?.code === 'string' ? detail.detail.code : null;
     this.limit = Number.isFinite(detail?.detail?.limit) ? detail.detail.limit : null;
     this.retryAfter = retryAfter;
+    this.idempotencyKey = null;
   }
 }
 /** HTTP 401: missing, invalid, expired or inactive API key. */
@@ -83,7 +88,10 @@ export class InvalidRequestError extends EtchvError {}
 export class RateLimitError extends EtchvError {}
 /** HTTP 5xx: the service or a dependency is unavailable. */
 export class ServiceUnavailableError extends EtchvError {}
-/** The client deadline passed (`statusCode` 0). A durable job may still complete. */
+/**
+ * The client deadline passed (`statusCode` 0). A durable job or a retried detection may still
+ * complete; `idempotencyKey` (also `detail.idempotencyKey`) is the key to recover it with.
+ */
 export class EtchvTimeoutError extends EtchvError {}
 /**
  * `submitBatch` failed after the batch was created: an upload (or the start) could not
@@ -166,6 +174,9 @@ function encodeData(data) {
 }
 
 const callOptions = ({ signal, timeout } = {}) => ({ signal, timeout });
+
+// A batch archive's connection dropped (or stalled) mid-body; `cause` is the network error.
+class ArchiveDrop extends Error {}
 
 const archiveTooLarge = requestId => new EtchvError(200, { detail: { code: 'archive_too_large',
   message: `The archive is larger than ${ARCHIVE_MAX_BYTES / MB} MiB; download each item's result instead` } }, requestId);
@@ -333,35 +344,68 @@ export class Etchv {
       if (detect || !path.startsWith('watermarks/documents')) throw new TypeError('activeContent applies to PDF documents only');
       path += (path.includes('?') ? '&' : '?') + new URLSearchParams({ active_content: checkChoice('activeContent', activeContent, ACTIVE_CONTENT) });
     }
-    const form = new FormData();
-    if (file.byteLength > this.#largeFileThreshold) {
-      // Too large for one request body: upload once; every retry sends the same upload_id.
-      const kind = detect ? 'detect' : UPLOAD_KINDS[path.split('/')[1]];
-      const upload = await this.uploadFile(kind, file, { filename, signal, timeout });
-      form.append('upload_id', upload.upload_id);
-    } else {
-      form.append('file', new Blob([file], { type: 'application/octet-stream' }), filename);
-    }
-    if (data !== undefined) form.append('data', data);
     const route = path.split('?')[0];
     const accepted = route.endsWith('/async');
     const durable = accepted || DURABLE.includes(route);
+    const resend = REPLAYABLE.includes(route);
     const headers = this.#headers();
-    const key = idempotencyKey ?? (durable ? globalThis.crypto.randomUUID() : undefined);
+    const key = idempotencyKey ?? (durable || resend ? globalThis.crypto.randomUUID() : undefined);
     if (key !== undefined) headers['Idempotency-Key'] = key;
-    return this.#request(path, { method: 'POST', headers, body: form }, { durable, accepted, idempotencyKey: key, signal, timeout });
+    const large = file.byteLength > this.#largeFileThreshold;
+    let deadline;
+    const send = async () => {
+      const form = new FormData();
+      if (large) {
+        // Too large for one request body: upload once; every retry sends the same upload_id.
+        const kind = detect ? 'detect' : UPLOAD_KINDS[path.split('/')[1]];
+        const upload = await this.uploadFile(kind, file, { filename, signal, timeout });
+        form.append('upload_id', upload.upload_id);
+      } else {
+        form.append('file', new Blob([file], { type: 'application/octet-stream' }), filename);
+      }
+      if (data !== undefined) form.append('data', data);
+      deadline ??= Date.now() + (timeout ?? this.#timeout);
+      // A resend can find the first copy still holding this upload: wait as for request_in_progress.
+      return this.#request(path, { method: 'POST', headers, body: form }, { durable, accepted, resend, idempotencyKey: key, signal, timeout,
+        deadline, busy: large ? ['request_in_progress', 'upload_in_use'] : undefined });
+    };
+    try {
+      try {
+        return await send();
+      } catch (error) {
+        if (!large || !resend || error?.code !== 'upload_consumed') throw error;
+      }
+      // A dropped detection consumed the upload and kept no result (keepResult: false): the API
+      // re-runs it on the same bytes, so upload them again and resend with the same key, within the
+      // first send's deadline.
+      return await send();
+    } catch (error) {
+      // Upload failures too, including a network error from the upload itself: the caller can
+      // resend with this key.
+      if (key && error !== null && typeof error === 'object') error.idempotencyKey = key;
+      throw error;
+    }
   }
 
-  async #request(path, init, { durable = false, accepted = false, retry = [429, 502, 503, 504], idempotencyKey, signal, timeout = this.#timeout } = {}) {
+  // `resend` is for a request the API answers the same way twice (a GET download, or an instant
+  // detection with its Idempotency-Key): it is sent again after a dropped connection and while the
+  // API answers 409 with a `busy` code (the first copy is still running), but no error status is
+  // retried.
+  async #request(path, init, { durable = false, accepted = false, resend = false, retry = [429, 502, 503, 504], busy = ['request_in_progress'],
+    idempotencyKey, signal, timeout = this.#timeout, deadline } = {}) {
     if (signal != null && !(signal instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
     if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new TypeError('timeout must be a positive integer');
     signal?.throwIfAborted();
     const detectionJob = path.startsWith('watermarks/videos/detect') || path.includes('detection-jobs/');
-    const deadline = Date.now() + timeout;
+    deadline ??= Date.now() + timeout;
     let requestId = path.match(/watermarks\/(?:detection-)?jobs\/(req_[a-f0-9]{64})/)?.[1] || null;
-    const expired = () => new EtchvTimeoutError(0, durable
+    const keyed = error => { if (idempotencyKey) error.idempotencyKey = idempotencyKey; return error; };
+    const expired = () => keyed(new EtchvTimeoutError(0, durable || (resend && idempotencyKey)
       ? { message: 'Client deadline exceeded; the job may still complete', idempotencyKey }
-      : { message: 'Client deadline exceeded' }, requestId);
+      : { message: 'Client deadline exceeded' }, requestId));
+    // A keyless download out of time rejects with its dropped connection, not a timeout.
+    const keyless = resend && !durable && !idempotencyKey;
+    let dropped = null;
     const pause = (seconds = 1) => new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(signal.reason);
       const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
@@ -389,11 +433,15 @@ export class Etchv {
         }
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
-        if (error?.name === 'TimeoutError' || Date.now() >= deadline) throw expired();
-        if (!durable) throw error;
+        if (error?.name === 'TimeoutError' || (Date.now() >= deadline && !keyless)) throw expired();
+        if (!durable && !resend) throw error;
+        // A download out of time; a keyed request ends with EtchvTimeoutError and its key.
+        dropped = keyless ? error : null;
+        if (dropped && Date.now() + 1000 >= deadline) throw error;
         await pause();
         continue;
       }
+      dropped = null;
       if ([200, 201, 204].includes(response.status) || (accepted && response.status === 202)) {
         return new Response(response.status === 204 ? null : body, { status: response.status, headers: response.headers });
       }
@@ -401,7 +449,7 @@ export class Etchv {
       try { detail = JSON.parse(detail); } catch { /* Preserve error text. */ }
       if (durable && response.status === 202) {
         if (!detail || typeof detail !== 'object' || !IDS.request[0].test(detail.request_id)) {
-          throw new EtchvError(202, 'Invalid job response', requestId);
+          throw keyed(new EtchvError(202, 'Invalid job response', requestId));
         }
         requestId = detail.request_id;
         // Construct a trusted local path; never send API keys to a server-supplied URL.
@@ -410,20 +458,25 @@ export class Etchv {
         await pause(retryDelay(response));
         continue;
       }
+      if (resend && response.status === 409 && busy.includes(detail?.detail?.code)) {
+        await pause(retryDelay(response));
+        continue;
+      }
       if (durable && retry.includes(response.status) && detail?.status !== 'failed') {
         // Honor Retry-After (capped at 5 s); pause() never waits past the deadline.
         await pause(response.status === 429 ? retryDelay(response) : 1);
         continue;
       }
-      throw errorFor(response.status, detail, requestId, retryAfterSeconds(response.headers.get('retry-after')));
+      throw keyed(errorFor(response.status, detail, requestId, retryAfterSeconds(response.headers.get('retry-after'))));
     }
+    if (dropped) throw dropped;
     throw expired();
   }
 
-  async #call(path, { method = 'GET', body, accepted = false, signal, timeout } = {}) {
+  async #call(path, { method = 'GET', body, accepted = false, resend = false, signal, timeout } = {}) {
     const headers = this.#headers(body === undefined ? {} : { 'Content-Type': 'application/json' });
     return this.#request(path, { method, headers, ...(body === undefined ? {} : { body: encodeJson(body) }) },
-      { accepted, signal, timeout });
+      { accepted, resend, signal, timeout });
   }
 
   async #json(path, options) {
@@ -711,18 +764,25 @@ export class Etchv {
    * Wait for and download the zip of a batch created with `archive: true`: every successful
    * result plus `manifest.json`. It can reach 1 GB; `downloadBatchArchiveTo` streams it to a
    * file instead of memory. `timeout` bounds the wait for the archive (default one hour); the
-   * download itself only fails if no data arrives for the client timeout. Rejects with
+   * download itself only fails if no data arrives for the client timeout. A connection dropped
+   * mid-download starts the download again from the beginning until `timeout` passes (the
+   * archive route does not resume). Rejects with
    * `ConflictError` (`code` `archive_not_requested`, `batch_not_started`, `archive_too_large`
    * or `archive_unavailable`) or `GoneError` after 24 hours or for an expired draft, and with
    * `EtchvError` (`code` `archive_too_large`, not retried) above `ARCHIVE_MAX_BYTES`.
    */
   async downloadBatchArchive(batchId, options = {}) {
-    const opened = await this.#openArchive(batchId, options);
-    const length = Number(opened.response.headers.get('content-length'));
-    let buffer = Number.isSafeInteger(length) && length > 0 ? new Uint8Array(length) : null;
-    const chunks = [];
-    let size = 0;
-    await this.#readArchive(opened, (chunk) => {
+    let buffer;
+    let chunks;
+    let size;
+    // Before each attempt, so a restarted download drops what the last one received.
+    const start = (response) => {
+      const length = Number(response.headers.get('content-length'));
+      if (!buffer || buffer.byteLength !== length) buffer = Number.isSafeInteger(length) && length > 0 ? new Uint8Array(length) : null;
+      chunks = [];
+      size = 0;
+    };
+    await this.#streamArchive(batchId, options, (chunk) => {
       if (buffer && size + chunk.byteLength <= buffer.byteLength) {
         buffer.set(chunk, size); // One allocation when the length is known.
       } else {
@@ -730,7 +790,7 @@ export class Etchv {
         chunks.push(chunk);
       }
       size += chunk.byteLength;
-    });
+    }, start);
     if (buffer) return size === buffer.byteLength ? buffer : buffer.slice(0, size);
     const bytes = new Uint8Array(size);
     let offset = 0;
@@ -741,35 +801,72 @@ export class Etchv {
   /**
    * Like `downloadBatchArchive`, but streams the zip to a file path or a Node.js writable
    * stream (which is not ended) and resolves with the number of bytes written. A path is
-   * written through a `.part` file that replaces it only once the download is complete.
+   * written through a `.part` file that replaces it only once the download is complete; after a
+   * dropped connection the `.part` file is emptied and the zip is streamed again. A stream
+   * already passed the bytes on and cannot take them back, so a drop mid-download rejects instead.
    */
   async downloadBatchArchiveTo(batchId, destination, options = {}) {
     if (typeof destination !== 'string' && typeof destination?.write !== 'function') {
       throw new TypeError('destination must be a file path or a writable stream');
     }
     if (typeof destination !== 'string') {
-      const opened = await this.#openArchive(batchId, options);
-      return this.#readArchive(opened, async (chunk) => {
+      return this.#streamArchive(batchId, options, async (chunk) => {
         if (!destination.write(chunk)) await once(destination, 'drain');
       });
     }
     const partial = `${destination}.part`;
     // Open the file first so a bad path fails before any waiting.
     let handle = await open(partial, 'w');
-    let opened;
+    let written = false;
+    const start = async () => {
+      if (!written) return;
+      // Reopening with 'w' empties the file and puts the next write at its start.
+      await handle.close();
+      handle = null;
+      handle = await open(partial, 'w');
+      written = false;
+    };
     try {
-      opened = await this.#openArchive(batchId, options);
-      const size = await this.#readArchive(opened, async (chunk) => { await handle.write(chunk); });
+      const size = await this.#streamArchive(batchId, options, async (chunk) => { written = true; await handle.write(chunk); }, start);
       await handle.close();
       handle = null;
       await rename(partial, destination);
       return size;
     } catch (error) {
-      opened?.controller.abort();
-      opened?.release();
       await handle?.close().catch(() => {});
       await rm(partial, { force: true });
       throw error;
+    }
+  }
+
+  // Wait for the archive and stream it to `write`. The archive route serves no Range requests, so
+  // when the connection drops (or stalls for the client timeout) mid-body and the destination can
+  // start over, the download starts again from the beginning until the `timeout` deadline.
+  // `start(response)` runs before each attempt and drops what an earlier one wrote; without it a
+  // drop mid-body is thrown.
+  async #streamArchive(batchId, { timeout = 3_600_000, signal } = {}, write, start) {
+    const deadline = Date.now() + timeout;
+    let remaining = timeout;
+    while (true) {
+      const opened = await this.#openArchive(batchId, { timeout: remaining, signal });
+      let dropped;
+      try {
+        await start?.(opened.response);
+        return await this.#readArchive(opened, write);
+      } catch (error) {
+        opened.controller.abort();
+        opened.release();
+        if (!(error instanceof ArchiveDrop)) throw error;
+        dropped = error.cause;
+      }
+      if (signal?.aborted) throw signal.reason;
+      remaining = deadline - Date.now();
+      if (!start || remaining <= 0) {
+        if (dropped?.name === 'TimeoutError') throw new EtchvTimeoutError(0, { message: 'The archive download stalled', batchId }, opened.requestId);
+        throw dropped;
+      }
+      await sleep(Math.min(1000, remaining), signal);
+      remaining = Math.max(1, deadline - Date.now());
     }
   }
 
@@ -829,8 +926,9 @@ export class Etchv {
     }
   }
 
-  // Stream the body to `write`, checking the zip signature; each chunk resets the idle timer.
-  async #readArchive({ response, controller, requestId, arm, disarm, release, batchId }, write) {
+  // Stream the body to `write`, checking the zip signature; each chunk resets the idle timer. A
+  // failed read rejects with ArchiveDrop.
+  async #readArchive({ response, controller, requestId, arm, disarm, release }, write) {
     const invalid = () => new EtchvError(200, 'Invalid archive response', requestId);
     const reader = response.body?.getReader();
     let size = 0;
@@ -839,7 +937,9 @@ export class Etchv {
       if (!reader) throw invalid();
       while (true) {
         arm();
-        const { done, value } = await reader.read();
+        let next;
+        try { next = await reader.read(); } catch (error) { throw new ArchiveDrop('The archive download broke off', { cause: error }); }
+        const { done, value } = next;
         if (done) break;
         let chunk = value;
         if (head !== false) {
@@ -858,9 +958,6 @@ export class Etchv {
       return size;
     } catch (error) {
       controller.abort();
-      if (error?.name === 'TimeoutError') {
-        throw new EtchvTimeoutError(0, { message: 'The archive download stalled', batchId }, requestId);
-      }
       throw error;
     } finally {
       release();
@@ -976,9 +1073,12 @@ export class Etchv {
     ids.forEach(id => checkId('asset', id));
     await this.#call('assets/bulk-delete', { method: 'POST', body: { asset_ids: ids }, ...callOptions(options) });
   }
-  /** Download an asset's file. Throws `GoneError` (410) after its availability window. */
+  /**
+   * Download an asset's file. Throws `GoneError` (410) after its availability window. A dropped
+   * connection is retried within the client timeout.
+   */
   async downloadAsset(id, options = {}) {
-    return this.#bytes(`assets/${checkId('asset', id)}/content`, callOptions(options));
+    return this.#bytes(`assets/${checkId('asset', id)}/content`, { ...callOptions(options), resend: true });
   }
 
   // Webhooks
@@ -1060,9 +1160,12 @@ export class Etchv {
   async retryStorageDelivery(id, options = {}) {
     return this.#json(`storage/deliveries/${checkId('delivery', id)}/retry`, { method: 'POST', accepted: true, ...callOptions(options) });
   }
-  /** Download a stored object through Etchv, verified against the asset checksum. */
+  /**
+   * Download a stored object through Etchv, verified against the asset checksum. A dropped
+   * connection is retried within the client timeout.
+   */
   async downloadStorageDelivery(id, options = {}) {
-    return this.#bytes(`storage/deliveries/${checkId('delivery', id)}/content`, callOptions(options));
+    return this.#bytes(`storage/deliveries/${checkId('delivery', id)}/content`, { ...callOptions(options), resend: true });
   }
 
   // Synchronous watermarking
@@ -1095,20 +1198,42 @@ export class Etchv {
 
   // Synchronous detection
 
-  /** Detect a watermark in an image. Not retried automatically. */
+  /**
+   * Detect a watermark in an image. A dropped connection is retried with the same idempotency key
+   * (generated when omitted) until the client timeout, and so is a retry the API reports as still
+   * running (409 `request_in_progress`, or `upload_in_use` while the first copy holds the file's
+   * upload). The API returns the first result without charging again. Other errors are not
+   * retried: 409 `replay_expired` or `request_failed` reject with `ConflictError`. Every error,
+   * including `EtchvTimeoutError` when time runs out, carries the key as `idempotencyKey`. The API
+   * keeps the result 24 hours for those retries; with `keepResult: false` it keeps nothing, and a
+   * retry runs detection again on the resent file at no charge (a file that went through an
+   * upload is uploaded again, bounded like any upload; the resend after it stays within the
+   * client timeout counted from the first send). A network error from the upload carries the key
+   * as `idempotencyKey` too.
+   */
   async detectImage(image, options = {}) { return this.#detect('images', image, options); }
-  /** Detect watermarks in a PDF (each page), DOCX or PPTX. Not retried automatically. */
+  /**
+   * Detect watermarks in a PDF (each page), DOCX or PPTX. Retried like `detectImage`. `keepResult`
+   * applies to detection answered in the request; a long PDF runs as a job, which keeps its result
+   * like any job.
+   */
   async detectDocument(document, options = {}) { return this.#detect('documents', document, { filename: 'document.pdf', ...options }); }
   /** Detect watermarks in a video; waits for the durable detection job. */
   async detectVideo(video, options = {}) { return this.#detect('videos', video, { filename: 'video.mp4', ...options }); }
   async #detect(media, file, options) {
     if (options.storageDestinationId != null || options.storageKey != null) throw new TypeError('Storage destinations apply to embedding jobs only');
+    const { keepResult, ...rest } = options;
+    if (keepResult != null) {
+      if (media === 'videos') throw new TypeError('keepResult applies to image and document detection only');
+      if (typeof keepResult !== 'boolean') throw new TypeError('keepResult must be a boolean');
+    }
     if (media !== 'videos' && file instanceof Uint8Array && file.byteLength > SYNC_DETECT_MAX_BYTES) {
       // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
-      const receipt = await this.submitDetection(media, file, options);
+      const receipt = await this.submitDetection(media, file, rest);
       return this.getDetectionResult(receipt.request_id, callOptions(options));
     }
-    return this.#detectionResult(await this.#post(`watermarks/${media}/detect`, file, options));
+    const path = `watermarks/${media}/detect` + (keepResult != null ? `?keep_result=${keepResult}` : '');
+    return this.#detectionResult(await this.#post(path, file, rest));
   }
   async #detectionResult(response) {
     const requestId = response.headers.get('x-request-id');

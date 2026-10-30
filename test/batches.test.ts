@@ -327,8 +327,9 @@ test('archive downloads use an idle timeout, not a total one', async () => {
   const sdk = client((_url, init) => new Response(slowZip(5, 40, init.signal)), { timeout: 100 });
   const bytes = await sdk.downloadBatchArchive(batchId);
   assert.equal(bytes.byteLength, zip.byteLength + 16);
+  // A stall starts the download again like a dropped connection, until the archive timeout.
   const stalled = client((_url, init) => new Response(slowZip(2, 300, init.signal)), { timeout: 100 });
-  await assert.rejects(stalled.downloadBatchArchive(batchId), (error: any) => error instanceof EtchvTimeoutError && /stalled/.test(error.message));
+  await assert.rejects(stalled.downloadBatchArchive(batchId, { timeout: 1 }), (error: any) => error instanceof EtchvTimeoutError && /stalled/.test(error.message));
 });
 
 test('downloadBatchArchiveTo streams to a path or a writable stream', async (t) => {
@@ -487,6 +488,49 @@ test('an abort during the retry wait stops further uploads', async () => {
     error instanceof BatchSubmitError && error.code === 'batch_aborted' && error.batchId === batchId);
   assert.equal(puts, 1);
   assert.ok(Date.now() - started < 900, 'the 1 s retry wait ends at the abort');
+});
+
+// A body that breaks off after `head`, as a reset connection does.
+const dropped = (head: Uint8Array) => {
+  let sent = false;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) controller.error(new TypeError('terminated', { cause: new Error('ECONNRESET') }));
+      else { controller.enqueue(head); sent = true; }
+    },
+  }, { highWaterMark: 0 });
+};
+
+test('a dropped archive starts again from the beginning', async (t) => {
+  const waits = fastWaits(t);
+  const folder = await mkdtemp(join(tmpdir(), 'etchv-archive-'));
+  t.after(() => rm(folder, { recursive: true, force: true }));
+  const big = new Uint8Array(3 * 1024 * 1024).fill(7); big.set(zip);
+  let calls = 0;
+  const sdk = client((_url, init) => {
+    calls += 1;
+    assert.equal(init.headers.Range, undefined);
+    const headers = { 'content-length': String(big.byteLength) };
+    return new Response(calls % 2 ? dropped(big.subarray(0, 1024 * 1024)) : big, { headers });
+  });
+  const target = join(folder, 'out.zip');
+  assert.equal(await sdk.downloadBatchArchiveTo(batchId, target), big.byteLength);
+  assert.deepEqual(new Uint8Array(await readFile(target)), big);
+  assert.deepEqual(await sdk.downloadBatchArchive(batchId), big);
+  assert.equal(calls, 4);
+  assert.deepEqual(waits.filter(ms => ms === 1000), [1000, 1000]);
+  assert.deepEqual(await readdir(folder), ['out.zip']);
+});
+
+test('a dropped archive into a writable stream rejects: the bytes were already passed on', async () => {
+  let calls = 0;
+  const sdk = client(() => { calls += 1; return new Response(dropped(zip)); });
+  const sink = new PassThrough();
+  const received: Buffer[] = [];
+  sink.on('data', (chunk: Buffer) => received.push(chunk));
+  await assert.rejects(sdk.downloadBatchArchiveTo(batchId, sink), (error: any) => error instanceof TypeError && error.message === 'terminated');
+  assert.deepEqual(new Uint8Array(Buffer.concat(received)), zip);
+  assert.equal(calls, 1);
 });
 
 test('archives above the size cap are refused without retrying or allocating', async () => {

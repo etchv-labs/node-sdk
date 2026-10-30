@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.7.0
+
+- `detectImage` and `detectDocument` retry a dropped connection with the same
+  `Idempotency-Key`, now generated when omitted, until the call deadline. The
+  API returns the first result without charging again. A retry the API reports
+  as still running (409 `request_in_progress`) waits for `Retry-After` (up to 5
+  seconds) and is sent again; 409 `replay_expired` and `request_failed` reject
+  with `ConflictError`. When time runs out, `EtchvTimeoutError` carries the key.
+- `detectImage` and `detectDocument` take `keepResult` (`DetectOptions`). The
+  API keeps an instant detection's result 24 hours so a retry gets it back; with
+  `keepResult: false` it keeps nothing, and a retry runs detection again on the
+  resent file at no charge. A file sent through an upload session is uploaded
+  again for that, bounded like any upload; the resend after it stays within
+  the client timeout counted from the first send. A retry that finds the first
+  copy still using the upload (409 `upload_in_use`) waits like
+  `request_in_progress`.
+- `EtchvError.idempotencyKey` is the key a keyed call (embedding, a job or a
+  detection) was sent with, including a generated one, so it can be resent. A
+  network error from a detection's upload carries it as `idempotencyKey` too.
+- `downloadAsset` and `downloadStorageDelivery` retry a dropped connection
+  within the call deadline.
+- `downloadBatchArchive` and `downloadBatchArchiveTo` start the download again
+  from the beginning when the connection drops or stalls mid-download, emptying
+  the buffer or the `.part` file first. A writable stream still rejects, since
+  it already passed the bytes on.
+
 ## 1.6.0
 
 - `deleteLink` deletes a traceable link with every recipient's opens,

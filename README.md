@@ -132,7 +132,10 @@ rejected (`upload_not_received`, `invalid_input`, ...) without a charge, and
 failed files are refunded, so one bad file never stops the rest. Results are
 kept 24 hours; the archive (with `archive: true`) holds every successful result
 plus `manifest.json` and is limited to 1 GB. `downloadBatchArchiveTo` streams it
-to a path or writable stream; `downloadBatchArchive` returns a `Uint8Array`.
+to a path or writable stream; `downloadBatchArchive` returns a `Uint8Array`. If
+the connection drops mid-download, the download starts again from the
+beginning; a writable stream has already passed the bytes on, so it rejects
+instead.
 
 More than 100 items reject with a `RangeError` before any request; split larger
 sets into several batches. Pass `webhookId` to get one
@@ -214,6 +217,27 @@ results retry HTTP 429 and transient 5xx responses after `Retry-After` (up to 5 
 per wait) until the call deadline; other calls reject with `RateLimitError` so you
 can back off. Errors also expose `code` (for example `rate_limited` or
 `concurrency_limited`), `limit` and `retryAfter` in seconds when the API sends them.
+
+These calls also retry a dropped connection within the call deadline:
+`embedImage`, `embedDocument`, `embedVideo`, `detectVideo`, `submitEmbed`,
+`submitDetection`, `getEmbedResult`, `getDetectionResult`, `submitBatch`,
+`submitBatchZip`, `getBatch`, `waitForBatch`, `cancelBatch`, `listBatches`,
+`createLink`, `detectImage`, `detectDocument`, `downloadAsset`,
+`downloadStorageDelivery`, `downloadBatchArchive` and `downloadBatchArchiveTo`.
+Other calls reject with the network error.
+
+`detectImage` and `detectDocument` resend with the same `idempotencyKey`
+(generated when omitted), and the API returns the first result without
+charging again. A retry the API reports as still running (409
+`request_in_progress`, or `upload_in_use` for a file sent through an upload)
+waits and is sent again. The API keeps the result 24 hours for this; pass
+`keepResult: false` to keep nothing, and a retry then runs detection again at
+no charge, after the SDK uploads the file again if it went through an upload.
+The detection requests, resends included, stay within one client timeout
+counted from the first send; uploading the file again is bounded like any
+upload. Errors from a keyed call carry its `idempotencyKey`, and so does a
+network error from its upload, so you can resend it yourself. A batch archive starts
+again from the beginning.
 
 ```js
 import { EtchvError } from '@etchv-labs/sdk';

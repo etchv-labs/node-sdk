@@ -45,6 +45,18 @@ export interface RequestOptions extends CallOptions {
    */
   accelerator?: Accelerator;
 }
+/** Options for instant image and document detection (`detectImage`, `detectDocument`). */
+export interface DetectOptions extends RequestOptions {
+  /**
+   * The API keeps an instant detection's result 24 hours, so a retry with the same
+   * `idempotencyKey` gets it back without charging again (`true`, the API default). With
+   * `false` it keeps nothing, and a retry runs detection again on the resent file at no charge; a
+   * file that went through an upload is uploaded again, bounded like any upload; the resend after it
+   * stays within the client timeout counted from the first send. A
+   * detection that runs as a job keeps its result like any job.
+   */
+  keepResult?: boolean;
+}
 export interface AsyncOptions extends RequestOptions {
   /** Enabled webhook endpoint (`wh_…`) that receives a signed terminal event. */
   webhookId?: string;
@@ -115,6 +127,11 @@ export declare class EtchvError extends Error {
   limit: number | null;
   /** `Retry-After` delay in seconds, when the API sent one (HTTP 429). */
   retryAfter: number | null;
+  /**
+   * The key a keyed call (embedding, a job or a detection) was sent with, generated or yours:
+   * resend with it to get the same result without a second charge. `null` for other calls.
+   */
+  idempotencyKey: string | null;
 }
 /** HTTP 401. */ export declare class AuthenticationError extends EtchvError {}
 /** HTTP 402. */ export declare class PaymentRequiredError extends EtchvError {}
@@ -125,7 +142,7 @@ export declare class EtchvError extends Error {
 /** HTTP 413 or 422. */ export declare class InvalidRequestError extends EtchvError {}
 /** HTTP 429. */ export declare class RateLimitError extends EtchvError {}
 /** HTTP 5xx. */ export declare class ServiceUnavailableError extends EtchvError {}
-/** Client deadline exceeded (`statusCode` 0). `detail.idempotencyKey` is set for durable operations. */
+/** Client deadline exceeded (`statusCode` 0). `idempotencyKey` (and `detail.idempotencyKey`) is set for durable operations and retried detections. */
 export declare class EtchvTimeoutError extends EtchvError {}
 /**
  * `submitBatch` failed after the batch was created. Call `submitBatch` again with
@@ -392,10 +409,17 @@ export declare class Etchv {
   embedDocument(document: Uint8Array, data: Record<string, JsonValue>, options?: DocumentOptions): Promise<EmbedResult>;
   /** Watermark an MP4, MOV, WebM, Matroska, MPEG or AVI video and wait for the verified file. */
   embedVideo(video: Uint8Array, data: Record<string, JsonValue>, options?: RequestOptions): Promise<EmbedResult>;
-  /** Detect an image watermark (synchronous; not retried). */
-  detectImage(image: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
-  /** Detect watermarks in a PDF (page by page), DOCX or PPTX (synchronous; not retried). */
-  detectDocument(document: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
+  /**
+   * Detect an image watermark (synchronous). A dropped connection, or a retry the API reports as
+   * still running (409 `request_in_progress`, or `upload_in_use` while the first copy holds the
+   * file's upload), is sent again with the same `idempotencyKey` (generated when omitted) until the
+   * client timeout; the API returns the first result without charging again. 409 `replay_expired`
+   * or `request_failed` reject with `ConflictError`. Every error carries the key as
+   * `idempotencyKey`.
+   */
+  detectImage(image: Uint8Array, options?: DetectOptions): Promise<DetectionResult>;
+  /** Detect watermarks in a PDF (page by page), DOCX or PPTX (synchronous). Retried like `detectImage`. */
+  detectDocument(document: Uint8Array, options?: DetectOptions): Promise<DetectionResult>;
   /** Detect video watermarks; waits for the durable detection job. */
   detectVideo(video: Uint8Array, options?: RequestOptions): Promise<DetectionResult>;
 
@@ -427,12 +451,17 @@ export declare class Etchv {
   iterBatchResults(batchId: string, options?: WaitForBatchOptions): AsyncIterable<BatchItemResult>;
   /**
    * Wait for and download the batch zip (`archive: true`). `timeout` bounds the wait; the
-   * download fails only when no data arrives for the client timeout. Rejects with
+   * download fails only when no data arrives for the client timeout. A dropped connection starts
+   * the download again from the beginning until `timeout` passes. Rejects with
    * `ConflictError` (`archive_not_requested`, `batch_not_started`, `archive_too_large`,
    * `archive_unavailable`) or `GoneError`.
    */
   downloadBatchArchive(batchId: string, options?: Omit<WaitForBatchOptions, 'pollInterval'>): Promise<Uint8Array>;
-  /** Stream the batch zip to a file path (through a `.part` file) or a writable stream; resolves with the bytes written. */
+  /**
+   * Stream the batch zip to a file path (through a `.part` file) or a writable stream; resolves with
+   * the bytes written. After a dropped connection a path's `.part` file is emptied and the zip is
+   * streamed again; a writable stream cannot take back what it was given, so the drop rejects.
+   */
   downloadBatchArchiveTo(batchId: string, destination: string | NodeJS.WritableStream, options?: Omit<WaitForBatchOptions, 'pollInterval'>): Promise<number>;
   /** Cancel a batch: files still waiting fail with error code `cancelled` and are refunded; queued and running files finish. */
   cancelBatch(batchId: string, options?: CallOptions): Promise<Batch>;
@@ -472,7 +501,7 @@ export declare class Etchv {
   deleteAsset(id: string, options?: CallOptions): Promise<void>;
   /** Atomically delete 1–50 assets. */
   deleteAssets(ids: string[], options?: CallOptions): Promise<void>;
-  /** Download an asset file. Rejects with `GoneError` after its availability window. */
+  /** Download an asset file, retrying a dropped connection. Rejects with `GoneError` after its availability window. */
   downloadAsset(id: string, options?: CallOptions): Promise<Uint8Array>;
 
   listWebhooks(options?: CallOptions): Promise<WebhookEndpoint[]>;
@@ -493,6 +522,7 @@ export declare class Etchv {
   /** Read a delivery. Returns 404 until the watermark job succeeds. */
   getStorageDelivery(id: string, options?: CallOptions): Promise<StorageDelivery>;
   retryStorageDelivery(id: string, options?: CallOptions): Promise<StorageDelivery>;
+  /** Download a stored object through Etchv, retrying a dropped connection. */
   downloadStorageDelivery(id: string, options?: CallOptions): Promise<Uint8Array>;
 }
 
